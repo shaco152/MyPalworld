@@ -1,0 +1,36 @@
+# Unreal Engine 生成产物
+/Binaries/
+/Intermediate/
+/DerivedDataCache/
+/Saved/
+/StagedBuilds/
+/Build/
+/Coverage/
+
+# 项目插件生成产物
+**/Binaries/
+**/Intermediate/
+**/DerivedDataCache/
+**/Saved/
+
+# Rider / Visual Studio
+/.vs/
+/.idea/
+*.user
+*.userosscache
+*.sln.docstates
+*.suo
+*.ncb
+*.opendb
+*.opensdf
+*.sdf
+*.cachefile
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 本地诊断/临时
+*.log
+*.tmp

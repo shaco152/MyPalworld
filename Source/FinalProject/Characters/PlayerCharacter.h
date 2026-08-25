@@ -11,6 +11,8 @@ class UAbilitySystemComponent;
 class USpringArmComponent;
 class UCameraComponent;
 class UPalStorageComponent;
+class UItemInventoryComponent;
+class UBuildingComponent;
 class UPlayerAttributeSet;
 class UTurnBattleComponent;
 
@@ -31,6 +33,12 @@ public:
 
 	// 帕鲁存储组件（背包 5 槽 + 仓库），捕捉入库 / 召唤都走它
 	UPalStorageComponent* GetStorageComponent() const { return StorageComponent; }
+
+	// 通用可堆叠物品背包（当前材料拾取/建造消耗使用）
+	UItemInventoryComponent* GetItemInventoryComponent() const { return ItemInventory; }
+
+	// 建造目录、虚影、旋转、校验与放置状态机
+	UBuildingComponent* GetBuildingComponent() const { return BuildingComponent; }
 
 	// 属性集访问器（战斗系统读玩家血量用；属性集不是 ActorComponent，不能用 FindComponentByClass）
 	UPlayerAttributeSet* GetAttributeSet() const { return PlayerAttributeSet; }
@@ -71,6 +79,12 @@ protected:
 	// 帕鲁存储（背包/仓库数据），BP_PlayerCharacter 组件面板可直接改容量/预填测试数据
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "PalStorage")
 	TObjectPtr<UPalStorageComponent> StorageComponent;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Inventory")
+	TObjectPtr<UItemInventoryComponent> ItemInventory;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Building")
+	TObjectPtr<UBuildingComponent> BuildingComponent;
 
 	// 第三人称相机：弹簧臂跟随 PawnControlRotation，角色偏航跟随控制器
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Camera")

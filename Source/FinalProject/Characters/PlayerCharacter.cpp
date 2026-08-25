@@ -10,17 +10,22 @@
 #include "Camera/CameraComponent.h"
 #include "GameFramework/PlayerStart.h"
 #include "GameFramework/SpringArmComponent.h"
+#include "GameFramework/CharacterMovementComponent.h"
 #include "EngineUtils.h"
+#include "Net/UnrealNetwork.h"
 #include "TimerManager.h"
 #include "Storage/PalStorageComponent.h"
 #include "Items/ItemInventoryComponent.h"
+#include "Framework/PlayerDataLibrary.h"
 
 APlayerCharacter::APlayerCharacter()
 {
+	bReplicates = true;
+	SetReplicateMovement(true);
 	AbilitySystem = CreateDefaultSubobject<UAbilitySystemComponent>(TEXT("AbilitySystem"));
+	AbilitySystem->SetIsReplicated(true);
+	AbilitySystem->SetReplicationMode(EGameplayEffectReplicationMode::Mixed);
 	PlayerAttributeSet = CreateDefaultSubobject<UPlayerAttributeSet>(TEXT("PlayerAttributeSet"));
-	StorageComponent = CreateDefaultSubobject<UPalStorageComponent>(TEXT("PalStorage"));
-	ItemInventory = CreateDefaultSubobject<UItemInventoryComponent>(TEXT("ItemInventory"));
 	BuildingComponent = CreateDefaultSubobject<UBuildingComponent>(TEXT("BuildingComponent"));
 	TurnBattle = CreateDefaultSubobject<UTurnBattleComponent>(TEXT("TurnBattle"));
 	ThrowAbilityClass = UGA_ThrowPalSphere::StaticClass();
@@ -46,6 +51,22 @@ UAbilitySystemComponent* APlayerCharacter::GetAbilitySystemComponent() const
 	return AbilitySystem;
 }
 
+void APlayerCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	DOREPLIFETIME(APlayerCharacter, bIsDead);
+}
+
+UPalStorageComponent* APlayerCharacter::GetStorageComponent() const
+{
+	return UPlayerDataLibrary::ResolvePalStorage(this);
+}
+
+UItemInventoryComponent* APlayerCharacter::GetItemInventoryComponent() const
+{
+	return UPlayerDataLibrary::ResolveItemInventory(this);
+}
+
 bool APlayerCharacter::IsInTurnBattle() const
 {
 	return TurnBattle && TurnBattle->IsActive();
@@ -64,6 +85,10 @@ void APlayerCharacter::PossessedBy(AController* NewController)
 	Super::PossessedBy(NewController);
 	UE_LOG(LogTemp, Warning, TEXT("[诊断] APlayerCharacter::PossessedBy: Actor=%s(%s), Controller=%s"), *GetName(), *GetClass()->GetName(), *GetNameSafe(NewController));
 	InitAbilitySystem();
+	if (BuildingComponent)
+	{
+		BuildingComponent->RefreshDataSource();
+	}
 }
 
 void APlayerCharacter::InitAbilitySystem()
@@ -84,12 +109,18 @@ void APlayerCharacter::InitAbilitySystem()
 
 	// 注册玩家属性集（与帕鲁同模式：AddSpawnedAttribute 查重幂等；数值配置走普通 float）
 	AbilitySystem->AddSpawnedAttribute(PlayerAttributeSet);
-	PlayerAttributeSet->InitHealth(InitialHealth);
-	PlayerAttributeSet->InitMaxHealth(InitialMaxHealth);
+	if (HasAuthority())
+	{
+		PlayerAttributeSet->InitHealth(InitialHealth);
+		PlayerAttributeSet->InitMaxHealth(InitialMaxHealth);
+	}
 
 	// 授予投掷/攻击能力（幂等）
-	GrantAbilityIfMissing(ThrowAbilityClass, CaptureTags::TAG_InputTag_Throw.GetTag());
-	GrantAbilityIfMissing(AttackAbilityClass, CaptureTags::TAG_InputTag_Attack.GetTag());
+	if (HasAuthority())
+	{
+		GrantAbilityIfMissing(ThrowAbilityClass, CaptureTags::TAG_InputTag_Throw.GetTag());
+		GrantAbilityIfMissing(AttackAbilityClass, CaptureTags::TAG_InputTag_Attack.GetTag());
+	}
 }
 
 void APlayerCharacter::GrantAbilityIfMissing(TSubclassOf<UGameplayAbility> AbilityClass, const FGameplayTag& InputTag)
@@ -123,14 +154,8 @@ void APlayerCharacter::HandleDeath()
 		return;
 	}
 	bIsDead = true;
-
-	// 隐藏 + 无碰撞 + 禁用输入
-	SetActorEnableCollision(false);
-	GetMesh()->SetVisibility(false, true);
-	if (APlayerController* PC = Cast<APlayerController>(GetController()))
-	{
-		DisableInput(PC);
-	}
+	ApplyDeathPresentation();
+	ForceNetUpdate();
 
 	UE_LOG(LogTemp, Warning, TEXT("[诊断] APlayerCharacter::HandleDeath: 玩家死亡，3 秒后重生"));
 	if (GEngine)
@@ -163,8 +188,8 @@ void APlayerCharacter::Respawn()
 	}
 
 	SetActorLocation(SpawnLoc, false, nullptr, ETeleportType::ResetPhysics);
-	SetActorEnableCollision(true);
-	GetMesh()->SetVisibility(true, true);
+	ApplyDeathPresentation();
+	ForceNetUpdate();
 
 	// 满血复活（Init* 不走 GE，不会触发 PostGameplayEffectExecute → 手动广播通知 UI）
 	if (PlayerAttributeSet)
@@ -174,14 +199,51 @@ void APlayerCharacter::Respawn()
 		PlayerAttributeSet->OnHealthChanged.Broadcast(PlayerAttributeSet->GetHealth(), PlayerAttributeSet->GetMaxHealth());
 	}
 
-	if (APlayerController* PC = Cast<APlayerController>(GetController()))
-	{
-		EnableInput(PC);
-	}
-
 	UE_LOG(LogTemp, Warning, TEXT("[诊断] Respawn: 玩家重生在 %s"), *SpawnLoc.ToString());
 	if (GEngine)
 	{
 		GEngine->AddOnScreenDebugMessage(-1, 3.f, FColor::Green, TEXT("已重生"));
+	}
+}
+
+void APlayerCharacter::OnRep_IsDead()
+{
+	ApplyDeathPresentation();
+}
+
+void APlayerCharacter::ApplyDeathPresentation()
+{
+	SetActorEnableCollision(!bIsDead);
+	if (USkeletalMeshComponent* CharacterMesh = GetMesh())
+	{
+		CharacterMesh->SetVisibility(!bIsDead, true);
+	}
+	if (UCharacterMovementComponent* Movement = GetCharacterMovement())
+	{
+		if (bIsDead)
+		{
+			Movement->StopMovementImmediately();
+			Movement->DisableMovement();
+		}
+		else
+		{
+			Movement->SetMovementMode(MOVE_Walking);
+		}
+	}
+}
+
+void APlayerCharacter::PlayAttackMontageReplicated(UAnimMontage* Montage)
+{
+	if (HasAuthority() && Montage)
+	{
+		MulticastPlayAttackMontage(Montage);
+	}
+}
+
+void APlayerCharacter::MulticastPlayAttackMontage_Implementation(UAnimMontage* Montage)
+{
+	if (Montage)
+	{
+		PlayAnimMontage(Montage);
 	}
 }

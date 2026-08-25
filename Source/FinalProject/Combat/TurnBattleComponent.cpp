@@ -15,8 +15,10 @@
 #include "EngineUtils.h"
 #include "GameFramework/PlayerController.h"
 #include "Storage/PalStorageComponent.h"
+#include "Framework/PlayerDataLibrary.h"
 #include "TimerManager.h"
 #include "UI/TurnBattleWidget.h"
+#include "Net/UnrealNetwork.h"
 
 namespace
 {
@@ -53,11 +55,29 @@ namespace
 UTurnBattleComponent::UTurnBattleComponent()
 {
 	PrimaryComponentTick.bCanEverTick = false;
+	SetIsReplicatedByDefault(true);
 	EnemyManager = CreateDefaultSubobject<UPalBattleEnemyManager>(TEXT("EnemyManager"));
+}
+
+void UTurnBattleComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	DOREPLIFETIME_CONDITION(UTurnBattleComponent, Phase, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UTurnBattleComponent, ReplicatedOurPal, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UTurnBattleComponent, ReplicatedCurrentEnemy, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UTurnBattleComponent, HPMedCooldown, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UTurnBattleComponent, MPMedCooldown, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UTurnBattleComponent, BattleMessage, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UTurnBattleComponent, BattleCamera, COND_OwnerOnly);
 }
 
 void UTurnBattleComponent::TryStartBattle()
 {
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		ServerTryStartBattle();
+		return;
+	}
 	if (IsActive())
 	{
 		return;
@@ -136,17 +156,6 @@ void UTurnBattleComponent::TryStartBattle()
 		return;
 	}
 
-	// 先创建 UI，失败时不改变任何世界帕鲁的状态。
-	if (APlayerController* PC = Cast<APlayerController>(Player->GetController()))
-	{
-		BattleWidget = CreateWidget<UTurnBattleWidget>(PC, BattleWidgetClass);
-	}
-	if (!BattleWidget)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[诊断] TryStartBattle: 战斗 UI 创建失败，未接管敌方名单"));
-		return;
-	}
-
 	// 我方打 Battling 标签：暂停自由战斗、禁止实时捕捉、伤害不自动派发死亡。
 	if (UAbilitySystemComponent* ASC = OurPal->GetAbilitySystemComponent())
 	{
@@ -168,7 +177,6 @@ void UTurnBattleComponent::TryStartBattle()
 			ASC->RemoveLooseGameplayTag(CaptureTags::TAG_State_Battle_Battling.GetTag());
 		}
 		ResumeAutoBattle(OurPal.Get());
-		BattleWidget = nullptr;
 		return;
 	}
 
@@ -189,34 +197,14 @@ void UTurnBattleComponent::TryStartBattle()
 
 	FActorSpawnParameters SpawnParams;
 	SpawnParams.Owner = Player;
-	BattleCamera = GetWorld()->SpawnActor<ACameraActor>(CamPos, FRotator::ZeroRotator, SpawnParams);
+	const FRotator CameraRotation = (Mid - CamPos).Rotation();
+	BattleCamera = GetWorld()->SpawnActor<ACameraActor>(CamPos, CameraRotation, SpawnParams);
 	if (BattleCamera)
 	{
-		BattleCamera->SetActorRotation((Mid - CamPos).Rotation());
-		if (APlayerController* PC = GetPlayerController())
-		{
-			PC->SetViewTargetWithBlend(BattleCamera, ViewTransitionDuration, EViewTargetBlendFunction::VTBlend_Cubic, 0.f, false);
-		}
-		UE_LOG(LogTemp, Warning, TEXT("[诊断] 观战相机已就位: %s，视角已切换"), *CamPos.ToString());
-	}
-
-	// GameAndUI：UI 可点击 + 游戏输入照常流动。移动/攻击由控制器守卫冻结；
-	// 切换页的 ←→/F/Esc 继续走 PlayerController 的 EnhancedInput，不依赖 Widget 键盘焦点。
-	if (APlayerController* PC = Cast<APlayerController>(Player->GetController()))
-	{
-		FInputModeGameAndUI Mode;
-		Mode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
-		Mode.SetHideCursorDuringCapture(false);
-		PC->SetInputMode(Mode);
-		PC->SetShowMouseCursor(true);
-	}
-
-	// 出战斗 UI
-	BattleWidget->InitFromBattle(this);
-	BattleWidget->AddToViewport(0);
-	if (APalPlayerController* PalPC = Cast<APalPlayerController>(Player->GetController()))
-	{
-		PalPC->SetPersistentHUDVisible(false);
+		BattleCamera->SetReplicates(true);
+		BattleCamera->SetReplicateMovement(false); // 初始 Transform 随 Actor 生成复制；后续旋转仅由拥有者客户端表现。
+		BattleCamera->bOnlyRelevantToOwner = true;
+		UE_LOG(LogTemp, Warning, TEXT("[诊断] 观战相机已就位: %s，等待拥有者客户端切换视角"), *CamPos.ToString());
 	}
 
 	// 玩家也进入回合制隔离：场外野生帕鲁的视觉过滤会拒绝带 Battling 标签的候选。
@@ -242,12 +230,18 @@ void UTurnBattleComponent::TryStartBattle()
 	Phase = ETurnBattlePhase::PlayerAction;
 	SetBattleMessage(FString::Printf(TEXT("遭遇战斗！%s 出现！"), *ActiveEnemy->GetClass()->GetName()));
 	RefreshWidget();
+	ClientOpenBattleUI(OurPal.Get(), ActiveEnemy, BattleCamera);
 	UE_LOG(LogTemp, Warning, TEXT("[诊断] 回合制战斗开始：敌方 %d 只（仅当前 1 只显示），我方 %s"),
 		EnemyManager->GetRemainingEnemyCount(), *OurPal->GetClass()->GetName());
 }
 
 void UTurnBattleComponent::TryUseSkill(int32 SlotIndex)
 {
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		ServerTryUseSkill(SlotIndex);
+		return;
+	}
 	if (Phase != ETurnBattlePhase::PlayerAction)
 	{
 		return;
@@ -318,6 +312,11 @@ void UTurnBattleComponent::TryUseSkill(int32 SlotIndex)
 
 void UTurnBattleComponent::TrySwitchPal(int32 PartyIndex)
 {
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		ServerTrySwitchPal(PartyIndex);
+		return;
+	}
 	if (Phase != ETurnBattlePhase::PlayerAction)
 	{
 		return;
@@ -369,6 +368,11 @@ void UTurnBattleComponent::TrySwitchPal(int32 PartyIndex)
 
 void UTurnBattleComponent::TryThrowBall()
 {
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		ServerTryThrowBall();
+		return;
+	}
 	if (Phase != ETurnBattlePhase::PlayerAction)
 	{
 		return;
@@ -435,6 +439,11 @@ void UTurnBattleComponent::TryThrowBall()
 
 void UTurnBattleComponent::TryUseMed(bool bHP)
 {
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		ServerTryUseMed(bHP);
+		return;
+	}
 	if (Phase != ETurnBattlePhase::PlayerAction)
 	{
 		return;
@@ -695,14 +704,7 @@ void UTurnBattleComponent::EndBattle()
 		}
 	}
 
-	// 视角 Blend 回玩家 + 玩家回原位 + 观战相机延迟销毁
-	if (APlayerController* PC = GetPlayerController())
-	{
-		if (Player)
-		{
-			PC->SetViewTargetWithBlend(Player, ViewTransitionDuration, EViewTargetBlendFunction::VTBlend_Cubic, 0.f, false);
-		}
-	}
+	// 拥有者客户端在 ClientCloseBattleUI 中 Blend 回 Pawn；服务器只恢复权威位置并回收相机。
 	if (Player && bStoredOriginalPlayerLocation)
 	{
 		FHitResult Hit;
@@ -716,12 +718,18 @@ void UTurnBattleComponent::EndBattle()
 	}
 
 	Phase = ETurnBattlePhase::Inactive;
+	ReplicatedOurPal = nullptr;
+	ReplicatedCurrentEnemy = nullptr;
+	ClientCloseBattleUI();
+	GetOwner()->ForceNetUpdate();
 	UE_LOG(LogTemp, Warning, TEXT("[诊断] 回合制战斗结束"));
 }
 
 APalCharacter* UTurnBattleComponent::GetCurrentEnemy() const
 {
-	return EnemyManager ? EnemyManager->GetActiveEnemy() : nullptr;
+	return GetOwner() && GetOwner()->HasAuthority()
+		? (EnemyManager ? EnemyManager->GetActiveEnemy() : nullptr)
+		: ReplicatedCurrentEnemy.Get();
 }
 
 bool UTurnBattleComponent::IsSwitchPanelVisible() const
@@ -801,17 +809,105 @@ APlayerCharacter* UTurnBattleComponent::GetOwnerPlayer() const
 
 UPalStorageComponent* UTurnBattleComponent::GetStorage() const
 {
-	const AActor* Owner = GetOwner();
-	return Owner ? Owner->FindComponentByClass<UPalStorageComponent>() : nullptr;
+	return UPlayerDataLibrary::ResolvePalStorage(GetOwner());
 }
 
 void UTurnBattleComponent::RefreshWidget()
 {
+	if (GetOwner() && GetOwner()->HasAuthority())
+	{
+		ReplicatedOurPal = OurPal.Get();
+		ReplicatedCurrentEnemy = EnemyManager ? EnemyManager->GetActiveEnemy() : nullptr;
+		GetOwner()->ForceNetUpdate();
+	}
 	if (BattleWidget)
 	{
 		BattleWidget->Refresh();
 	}
 }
+
+void UTurnBattleComponent::OnRep_BattleState()
+{
+	if (Phase == ETurnBattlePhase::Inactive)
+	{
+		ClientCloseBattleUI_Implementation();
+		return;
+	}
+	RefreshWidget();
+}
+
+void UTurnBattleComponent::ClientOpenBattleUI_Implementation(APalCharacter* InOurPal, APalCharacter* InEnemy,
+	ACameraActor* InCamera)
+{
+	ReplicatedOurPal = InOurPal;
+	ReplicatedCurrentEnemy = InEnemy;
+	BattleCamera = InCamera;
+	APlayerController* PC = GetPlayerController();
+	if (!PC || !PC->IsLocalController())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[诊断] 客户端观战相机切换失败：PC=%s"), *GetNameSafe(PC));
+		return;
+	}
+	if (BattleCamera)
+	{
+		PC->SetViewTargetWithBlend(BattleCamera, ViewTransitionDuration,
+			EViewTargetBlendFunction::VTBlend_Cubic, 0.f, false);
+	}
+	if (!BattleWidgetClass)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[诊断] 客户端战斗 UI 创建条件不足：Class=None"));
+		return;
+	}
+	if (!BattleWidget)
+	{
+		BattleWidget = CreateWidget<UTurnBattleWidget>(PC, BattleWidgetClass);
+	}
+	if (!BattleWidget)
+	{
+		return;
+	}
+	BattleWidget->InitFromBattle(this);
+	BattleWidget->AddToViewport(0);
+	FInputModeGameAndUI Mode;
+	Mode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+	Mode.SetHideCursorDuringCapture(false);
+	PC->SetInputMode(Mode);
+	PC->SetShowMouseCursor(true);
+	if (APalPlayerController* PalPC = Cast<APalPlayerController>(PC))
+	{
+		PalPC->SetPersistentHUDVisible(false);
+	}
+	RefreshWidget();
+}
+
+void UTurnBattleComponent::ClientCloseBattleUI_Implementation()
+{
+	if (BattleWidget)
+	{
+		BattleWidget->RemoveFromParent();
+		BattleWidget = nullptr;
+	}
+	if (APlayerController* PC = GetPlayerController(); PC && PC->IsLocalController())
+	{
+		if (APawn* PlayerPawn = PC->GetPawn())
+		{
+			PC->SetViewTargetWithBlend(PlayerPawn, ViewTransitionDuration,
+				EViewTargetBlendFunction::VTBlend_Cubic, 0.f, false);
+		}
+		if (APalPlayerController* PalPC = Cast<APalPlayerController>(PC))
+		{
+			PalPC->SetPersistentHUDVisible(true);
+		}
+		PC->SetInputMode(FInputModeGameOnly());
+		PC->SetShowMouseCursor(false);
+	}
+}
+
+void UTurnBattleComponent::ServerTryStartBattle_Implementation() { TryStartBattle(); }
+void UTurnBattleComponent::ServerTryUseSkill_Implementation(int32 SlotIndex) { TryUseSkill(SlotIndex); }
+void UTurnBattleComponent::ServerTrySwitchPal_Implementation(int32 PartyIndex) { TrySwitchPal(PartyIndex); }
+void UTurnBattleComponent::ServerTryThrowBall_Implementation() { TryThrowBall(); }
+void UTurnBattleComponent::ServerTryUseMed_Implementation(bool bHP) { TryUseMed(bHP); }
 
 void UTurnBattleComponent::SetBattleMessage(const FString& Msg)
 {

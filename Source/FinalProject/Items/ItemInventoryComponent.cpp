@@ -13,17 +13,36 @@ UItemInventoryComponent::UItemInventoryComponent()
 void UItemInventoryComponent::BeginPlay()
 {
 	Super::BeginPlay();
-	NormalizeStacks();
+	Stacks.Owner = this;
+	if (GetOwner() && GetOwner()->HasAuthority())
+	{
+		NormalizeStacks();
+		Stacks.MarkArrayDirty();
+		for (FItemStack& Stack : Stacks.Items)
+		{
+			Stacks.MarkItemDirty(Stack);
+		}
+	}
+	else
+	{
+		// Fast Array 的结构由服务器独占。兼容旧蓝图组件模板中预填的测试材料，
+		// 只保留首包中已经具有有效复制 ID 的权威条目。
+		const int32 Removed = Stacks.RemoveUnreplicatedLocalItems();
+		if (Removed > 0)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[诊断] 客户端清理本地材料 FastArray 占位项：Removed=%d"), Removed);
+		}
+	}
 	NotifyChanged();
 
 	UE_LOG(LogTemp, Warning, TEXT("[诊断] ItemInventory 初始化: Owner=%s 堆叠=%d/%d Definitions=%s"),
-		*GetNameSafe(GetOwner()), Stacks.Num(), StackCapacity, *GetNameSafe(ItemDefinitions));
+		*GetNameSafe(GetOwner()), Stacks.Items.Num(), StackCapacity, *GetNameSafe(ItemDefinitions));
 }
 
 void UItemInventoryComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
-	DOREPLIFETIME(UItemInventoryComponent, Stacks);
+	DOREPLIFETIME_CONDITION(UItemInventoryComponent, Stacks, COND_OwnerOnly);
 }
 
 const FItemDefinitionRow* UItemInventoryComponent::FindItemDefinition(FName ItemId) const
@@ -66,7 +85,7 @@ int32 UItemInventoryComponent::AddItem(FName ItemId, int32 Quantity)
 	}
 
 	int32 Remaining = Quantity;
-	for (FItemStack& Stack : Stacks)
+	for (FItemStack& Stack : Stacks.Items)
 	{
 		if (Stack.ItemId != ItemId || Stack.Quantity >= MaxStack)
 		{
@@ -74,6 +93,7 @@ int32 UItemInventoryComponent::AddItem(FName ItemId, int32 Quantity)
 		}
 		const int32 Added = FMath::Min(MaxStack - Stack.Quantity, Remaining);
 		Stack.Quantity += Added;
+		Stacks.MarkItemDirty(Stack);
 		Remaining -= Added;
 		if (Remaining <= 0)
 		{
@@ -81,13 +101,14 @@ int32 UItemInventoryComponent::AddItem(FName ItemId, int32 Quantity)
 		}
 	}
 
-	while (Remaining > 0 && Stacks.Num() < FMath::Max(1, StackCapacity))
+	while (Remaining > 0 && Stacks.Items.Num() < FMath::Max(1, StackCapacity))
 	{
 		const int32 Added = FMath::Min(MaxStack, Remaining);
-		FItemStack& NewStack = Stacks.AddDefaulted_GetRef();
+		FItemStack& NewStack = Stacks.Items.AddDefaulted_GetRef();
 		NewStack.ItemId = ItemId;
 		NewStack.Quantity = Added;
 		Remaining -= Added;
+		Stacks.MarkItemDirty(NewStack);
 	}
 
 	const int32 AddedTotal = Quantity - Remaining;
@@ -103,7 +124,7 @@ int32 UItemInventoryComponent::AddItem(FName ItemId, int32 Quantity)
 int32 UItemInventoryComponent::GetTotalQuantity(FName ItemId) const
 {
 	int32 Total = 0;
-	for (const FItemStack& Stack : Stacks)
+	for (const FItemStack& Stack : Stacks.Items)
 	{
 		if (Stack.ItemId == ItemId && Stack.Quantity > 0)
 		{
@@ -152,7 +173,7 @@ bool UItemInventoryComponent::ConsumeItems(const TArray<FItemAmount>& Costs)
 
 	for (TPair<FName, int32>& Required : RemainingById)
 	{
-		for (FItemStack& Stack : Stacks)
+		for (FItemStack& Stack : Stacks.Items)
 		{
 			if (Required.Value <= 0)
 			{
@@ -164,27 +185,36 @@ bool UItemInventoryComponent::ConsumeItems(const TArray<FItemAmount>& Costs)
 			}
 			const int32 Removed = FMath::Min(Stack.Quantity, Required.Value);
 			Stack.Quantity -= Removed;
+			Stacks.MarkItemDirty(Stack);
 			Required.Value -= Removed;
 		}
 	}
 
 	NormalizeStacks();
 	NotifyChanged();
-	UE_LOG(LogTemp, Warning, TEXT("[诊断] ItemInventory 已原子消耗配方材料，剩余堆叠=%d"), Stacks.Num());
+	UE_LOG(LogTemp, Warning, TEXT("[诊断] ItemInventory 已原子消耗配方材料，剩余堆叠=%d"), Stacks.Items.Num());
 	return true;
 }
 
 void UItemInventoryComponent::NormalizeStacks()
 {
-	Stacks.RemoveAll([](const FItemStack& Stack) { return !Stack.IsValid(); });
-
-	if (Stacks.Num() > FMath::Max(1, StackCapacity))
+	const int32 Removed = Stacks.Items.RemoveAll([](const FItemStack& Stack) { return !Stack.IsValid(); });
+	if (Removed > 0 && GetOwner() && GetOwner()->HasAuthority())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[诊断] ItemInventory 预填堆叠%d超过容量%d，尾部数据被裁剪"), Stacks.Num(), StackCapacity);
-		Stacks.SetNum(FMath::Max(1, StackCapacity));
+		Stacks.MarkArrayDirty();
 	}
 
-	for (FItemStack& Stack : Stacks)
+	if (Stacks.Items.Num() > FMath::Max(1, StackCapacity))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[诊断] ItemInventory 预填堆叠%d超过容量%d，尾部数据被裁剪"), Stacks.Items.Num(), StackCapacity);
+		Stacks.Items.SetNum(FMath::Max(1, StackCapacity));
+		if (GetOwner() && GetOwner()->HasAuthority())
+		{
+			Stacks.MarkArrayDirty();
+		}
+	}
+
+	for (FItemStack& Stack : Stacks.Items)
 	{
 		const int32 MaxStack = GetMaxStackSize(Stack.ItemId);
 		if (MaxStack > 0)
@@ -197,10 +227,43 @@ void UItemInventoryComponent::NormalizeStacks()
 void UItemInventoryComponent::NotifyChanged()
 {
 	OnInventoryChanged.Broadcast();
+	if (GetOwner() && GetOwner()->HasAuthority())
+	{
+		GetOwner()->ForceNetUpdate();
+	}
 }
 
-void UItemInventoryComponent::OnRep_Stacks()
+void UItemInventoryComponent::HandleReplicatedStacks()
 {
+	// 首次复制可能早于 BeginPlay，也可能与蓝图默认条目同时存在；每次收包都清理
+	// ReplicationID 无效的本地占位项，绝不在客户端补槽或规格化权威数组。
+	const int32 Removed = Stacks.RemoveUnreplicatedLocalItems();
+	if (Removed > 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[诊断] 材料 FastArray 收包后清理本地占位项：Removed=%d"), Removed);
+	}
+	NotifyChanged();
+}
+
+void UItemInventoryComponent::RestoreStacks(const TArray<FItemStack>& InStacks)
+{
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		return;
+	}
+	Stacks.Items = InStacks;
+	Stacks.MarkArrayDirty();
+	for (FItemStack& Stack : Stacks.Items)
+	{
+		Stacks.MarkItemDirty(Stack);
+	}
 	NormalizeStacks();
 	NotifyChanged();
+	GetOwner()->ForceNetUpdate();
+	UE_LOG(LogTemp, Warning, TEXT("[诊断] ItemInventory 已从存档恢复，堆叠=%d/%d"), Stacks.Items.Num(), StackCapacity);
+}
+
+void FReplicatedItemStackList::PostReplicatedReceive(const FFastArraySerializer::FPostReplicatedReceiveParameters& Parameters)
+{
+	if (Owner) Owner->HandleReplicatedStacks();
 }

@@ -13,11 +13,17 @@
 #include "Engine/Engine.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Storage/PalStorageComponent.h"
+#include "Framework/PlayerDataLibrary.h"
 #include "UI/PalHPBarWidget.h"
+#include "Net/UnrealNetwork.h"
 
 APalCharacter::APalCharacter()
 {
+	bReplicates = true;
+	SetReplicateMovement(true);
 	AbilitySystem = CreateDefaultSubobject<UAbilitySystemComponent>(TEXT("AbilitySystem"));
+	AbilitySystem->SetIsReplicated(true);
+	AbilitySystem->SetReplicationMode(EGameplayEffectReplicationMode::Minimal);
 	AttributeSet = CreateDefaultSubobject<UPalAttributeSet>(TEXT("AttributeSet"));
 	AutoBattle = CreateDefaultSubobject<UPalAutoBattleComponent>(TEXT("AutoBattle"));
 
@@ -53,7 +59,7 @@ void APalCharacter::BeginPlay()
 
 	// 野生帕鲁启用 AI（主动/被动都启，被动由感知过滤不主动索敌）；
 	// 召唤物（Storage 在 FinishSpawning 前打 Summoned 标签）、死亡、捕捉中、回合制中不按野生启动
-	if (AutoBattle && !IsDead())
+	if (HasAuthority() && AutoBattle && !IsDead())
 	{
 		const UAbilitySystemComponent* ASC = AbilitySystem;
 		const bool bSummoned = ASC && ASC->HasMatchingGameplayTag(CaptureTags::TAG_State_Pal_Summoned.GetTag());
@@ -166,11 +172,14 @@ void APalCharacter::InitAbilitySystem()
 
 	// 用设计器配置的初始数值覆盖属性集（编辑器改的是普通 float 配置项；
 	// FGameplayAttributeData 的 Base/Current 成员在引擎里是 protected 不可编辑，且运行时读 CurrentValue）
-	AttributeSet->InitHealth(InitialHealth);
-	AttributeSet->InitMaxHealth(InitialMaxHealth);
-	AttributeSet->InitLevel(InitialLevel);
-	AttributeSet->InitMP(InitialMP);
-	AttributeSet->InitMaxMP(InitialMaxMP);
+	if (HasAuthority())
+	{
+		AttributeSet->InitHealth(InitialHealth);
+		AttributeSet->InitMaxHealth(InitialMaxHealth);
+		AttributeSet->InitLevel(InitialLevel);
+		AttributeSet->InitMP(InitialMP);
+		AttributeSet->InitMaxMP(InitialMaxMP);
+	}
 
 	// 技能槽初始化：运行时槽为空 → 取 BP 配置的默认技能（野生帕鲁初始技能）
 	if (SkillRowNames.IsEmpty())
@@ -182,6 +191,29 @@ void APalCharacter::InitAbilitySystem()
 	// 落盘诊断：确认每个帕鲁实例实际应用的初始数值（排查"改了等级没生效"用）
 	UE_LOG(LogTemp, Warning, TEXT("[诊断] 属性初始化: %s | 配置 InitialLevel=%.0f/InitialHealth=%.0f/InitialMP=%.0f → 属性集 Level=%.0f/Health=%.0f/MP=%.0f/技能槽=%d"),
 		*GetName(), InitialLevel, InitialHealth, InitialMP, AttributeSet->GetLevel(), AttributeSet->GetHealth(), AttributeSet->GetMP(), SkillRowNames.Num());
+}
+
+void APalCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	DOREPLIFETIME(APalCharacter, SkillRowNames);
+	DOREPLIFETIME(APalCharacter, bIsDead);
+	DOREPLIFETIME(APalCharacter, CaptureNetState);
+}
+
+void APalCharacter::SetSkillRowNames(const TArray<FName>& InSkills)
+{
+	SkillRowNames = InSkills;
+	UPalSkillLibrary::NormalizeSkillSlots(SkillRowNames);
+	if (HasAuthority())
+	{
+		ForceNetUpdate();
+	}
+}
+
+void APalCharacter::OnRep_SkillRowNames()
+{
+	UPalSkillLibrary::NormalizeSkillSlots(SkillRowNames);
 }
 
 FRotator APalCharacter::GetFacingRotation(const FVector& Direction) const
@@ -219,7 +251,7 @@ void APalCharacter::HandleDeath()
 	{
 		if (AActor* OwnerActor = GetOwner())
 		{
-			if (UPalStorageComponent* Storage = OwnerActor->FindComponentByClass<UPalStorageComponent>())
+			if (UPalStorageComponent* Storage = UPlayerDataLibrary::ResolvePalStorage(OwnerActor))
 			{
 				Storage->HandleSummonedPalDeath(this);
 			}
@@ -264,26 +296,29 @@ float APalCharacter::GetCaptureChance_Implementation() const
 
 void APalCharacter::BeginCapture_Implementation(ACaptureBall* Ball, const FVector& HitLocation)
 {
+	if (!HasAuthority())
+	{
+		return;
+	}
+
 	// 防多球竞争标签
 	if (AbilitySystem)
 	{
 		AbilitySystem->AddLooseGameplayTag(CaptureTags::TAG_State_Pal_BeingCaptured.GetTag());
 	}
 
-	// 不可见（组件级隐藏，不用 SetActorHiddenInGame 以免整 Actor 隐藏）
-	GetMesh()->SetVisibility(false, true);
-	GetCapsuleComponent()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-
-	// 停止移动
-	if (UCharacterMovementComponent* MoveComp = GetCharacterMovement())
-	{
-		MoveComp->StopMovementImmediately();
-		MoveComp->SetMovementMode(MOVE_None);
-	}
+	CaptureNetState = EPalCaptureNetState::Capturing;
+	ApplyCaptureNetState();
+	ForceNetUpdate();
 }
 
 void APalCharacter::ResolveCapture_Implementation(bool bSuccess, const FVector& HitLocation)
 {
+	if (!HasAuthority())
+	{
+		return;
+	}
+
 	if (AbilitySystem)
 	{
 		AbilitySystem->RemoveLooseGameplayTag(CaptureTags::TAG_State_Pal_BeingCaptured.GetTag());
@@ -295,17 +330,46 @@ void APalCharacter::ResolveCapture_Implementation(bool bSuccess, const FVector& 
 		{
 			GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Green, FString::Printf(TEXT("%s 捕捉成功!"), *GetName()));
 		}
-		Destroy();
+		// 不能与状态修改同帧立即销毁：组件显隐本身不复制，网络销毁通知也可能在
+		// 客户端仍持有移动代理时到达。先复制 Captured，让所有客户端可靠隐藏并禁用碰撞，
+		// 再由服务器短延迟销毁 Actor。
+		CaptureNetState = EPalCaptureNetState::Captured;
+		ApplyCaptureNetState();
+		ForceNetUpdate();
+		SetLifeSpan(0.5f);
 		return;
 	}
 
 	// 失败：回到捕捉前位置（球传入），恢复可见 / 碰撞 / 移动
 	SetActorLocation(HitLocation, false, nullptr, ETeleportType::TeleportPhysics);
-	GetMesh()->SetVisibility(true, true);
-	GetCapsuleComponent()->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	CaptureNetState = EPalCaptureNetState::None;
+	ApplyCaptureNetState();
+	ForceNetUpdate();
+}
+
+void APalCharacter::OnRep_CaptureNetState()
+{
+	ApplyCaptureNetState();
+}
+
+void APalCharacter::ApplyCaptureNetState()
+{
+	const bool bHiddenForCapture = CaptureNetState != EPalCaptureNetState::None;
+	GetMesh()->SetVisibility(!bHiddenForCapture, true);
+	GetCapsuleComponent()->SetCollisionEnabled(
+		bHiddenForCapture ? ECollisionEnabled::NoCollision : ECollisionEnabled::QueryAndPhysics);
+	SetHPBarVisible(false);
 
 	if (UCharacterMovementComponent* MoveComp = GetCharacterMovement())
 	{
-		MoveComp->SetMovementMode(MOVE_Falling); // 落地后自动转回 Walking
+		if (bHiddenForCapture)
+		{
+			MoveComp->StopMovementImmediately();
+			MoveComp->SetMovementMode(MOVE_None);
+		}
+		else
+		{
+			MoveComp->SetMovementMode(MOVE_Falling); // 落地后自动转回 Walking
+		}
 	}
 }

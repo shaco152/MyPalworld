@@ -34,6 +34,7 @@ class FINALPROJECT_API UTurnBattleComponent : public UActorComponent
 
 public:
 	UTurnBattleComponent();
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	// 尝试开始战斗（P 键）：搜附近敌意野帕鲁 → 卷入 → 冻结角色 → 出战斗 UI
 	void TryStartBattle();
@@ -49,7 +50,7 @@ public:
 	void TryUseMed(bool bHP);
 
 	// --- UI 查询 ---
-	APalCharacter* GetOurPal() const { return OurPal.Get(); }
+	APalCharacter* GetOurPal() const { return GetOwner() && GetOwner()->HasAuthority() ? OurPal.Get() : ReplicatedOurPal.Get(); }
 	APalCharacter* GetCurrentEnemy() const;
 	UPalStorageComponent* GetStorage() const;
 	int32 GetHPMedCooldown() const { return HPMedCooldown; }
@@ -128,6 +129,24 @@ protected:
 	TSubclassOf<UTurnBattleWidget> BattleWidgetClass;
 
 private:
+	UFUNCTION(Server, Reliable)
+	void ServerTryStartBattle();
+	UFUNCTION(Server, Reliable)
+	void ServerTryUseSkill(int32 SlotIndex);
+	UFUNCTION(Server, Reliable)
+	void ServerTrySwitchPal(int32 PartyIndex);
+	UFUNCTION(Server, Reliable)
+	void ServerTryThrowBall();
+	UFUNCTION(Server, Reliable)
+	void ServerTryUseMed(bool bHP);
+
+	UFUNCTION(Client, Reliable)
+	void ClientOpenBattleUI(APalCharacter* InOurPal, APalCharacter* InEnemy, class ACameraActor* InCamera);
+	UFUNCTION(Client, Reliable)
+	void ClientCloseBattleUI();
+	UFUNCTION()
+	void OnRep_BattleState();
+
 	// --- 回合流程 ---
 	void StartEnemyTurn();
 	void FinishEnemyTurn();
@@ -151,6 +170,7 @@ private:
 	void RefreshWidget();
 	void SetBattleMessage(const FString& Msg);
 
+	UPROPERTY(ReplicatedUsing = OnRep_BattleState)
 	ETurnBattlePhase Phase = ETurnBattlePhase::Inactive;
 
 	// 敌方名单/候场/退场/原位恢复唯一所有者。
@@ -160,20 +180,29 @@ private:
 	// 我方当前出战帕鲁
 	TWeakObjectPtr<APalCharacter> OurPal;
 
+	UPROPERTY(ReplicatedUsing = OnRep_BattleState)
+	TObjectPtr<APalCharacter> ReplicatedOurPal;
+
+	UPROPERTY(ReplicatedUsing = OnRep_BattleState)
+	TObjectPtr<APalCharacter> ReplicatedCurrentEnemy;
+
 	UPROPERTY()
 	TObjectPtr<UTurnBattleWidget> BattleWidget;
 
 	// 通用药冷却（剩余回合数；每过一回合计 1，战斗结束清 0）
+	UPROPERTY(ReplicatedUsing = OnRep_BattleState)
 	int32 HPMedCooldown = 0;
+	UPROPERTY(ReplicatedUsing = OnRep_BattleState)
 	int32 MPMedCooldown = 0;
 
+	UPROPERTY(ReplicatedUsing = OnRep_BattleState)
 	FString BattleMessage;
 
 	FTimerHandle EnemyTurnTimer;
 	FTimerHandle EndTimer;
 
 	// 观战相机（独立于玩家的战斗镜头；结束 Blend 回玩家后销毁）
-	UPROPERTY()
+	UPROPERTY(Replicated)
 	TObjectPtr<class ACameraActor> BattleCamera;
 
 	// 进入战斗前的玩家位置（结束转回）

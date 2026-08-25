@@ -6,6 +6,48 @@
 #include "ItemInventoryComponent.generated.h"
 
 class UDataTable;
+class UItemInventoryComponent;
+
+USTRUCT(BlueprintType)
+struct FINALPROJECT_API FReplicatedItemStackList : public FFastArraySerializer
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Inventory")
+	TArray<FItemStack> Items;
+
+	bool NetDeltaSerialize(FNetDeltaSerializeInfo& DeltaParams)
+	{
+		return FFastArraySerializer::FastArrayDeltaSerialize<FItemStack, FReplicatedItemStackList>(Items, DeltaParams, *this);
+	}
+
+	void PostReplicatedReceive(const FFastArraySerializer::FPostReplicatedReceiveParameters& Parameters);
+
+	/**
+	 * 蓝图组件模板可能序列化了测试材料。客户端上的这些条目没有复制 ID，
+	 * 若不先清理，首包会把服务器条目追加在本地条目后面，造成数量翻倍且无法被服务器删除。
+	 */
+	int32 RemoveUnreplicatedLocalItems()
+	{
+		const int32 Removed = Items.RemoveAll([](const FItemStack& Item)
+		{
+			return Item.ReplicationID == INDEX_NONE;
+		});
+		if (Removed > 0)
+		{
+			ItemMap.Reset();
+		}
+		return Removed;
+	}
+
+	UItemInventoryComponent* Owner = nullptr;
+};
+
+template<>
+struct TStructOpsTypeTraits<FReplicatedItemStackList> : public TStructOpsTypeTraitsBase2<FReplicatedItemStackList>
+{
+	enum { WithNetDeltaSerializer = true };
+};
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnItemInventoryChanged);
 
@@ -32,8 +74,8 @@ public:
 	TObjectPtr<UDataTable> ItemDefinitions;
 
 	/** 可在 BP_Player 默认值中预填测试材料。 */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, ReplicatedUsing = OnRep_Stacks, Category = "Inventory")
-	TArray<FItemStack> Stacks;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Replicated, Category = "Inventory")
+	FReplicatedItemStackList Stacks;
 
 	UPROPERTY(BlueprintAssignable, Category = "Inventory")
 	FOnItemInventoryChanged OnInventoryChanged;
@@ -57,15 +99,15 @@ public:
 	bool GetItemDefinition(FName ItemId, FItemDefinitionRow& OutDefinition) const;
 
 	const FItemDefinitionRow* FindItemDefinition(FName ItemId) const;
-	const TArray<FItemStack>& GetStacks() const { return Stacks; }
+	const TArray<FItemStack>& GetStacks() const { return Stacks.Items; }
 	int32 GetStackCapacity() const { return StackCapacity; }
 	UDataTable* GetItemDefinitions() const { return ItemDefinitions; }
+	/** 存档恢复专用：Authority 替换完整堆叠快照。 */
+	void RestoreStacks(const TArray<FItemStack>& InStacks);
+	void HandleReplicatedStacks();
 
 protected:
 	virtual void BeginPlay() override;
-
-	UFUNCTION()
-	void OnRep_Stacks();
 
 private:
 	int32 GetMaxStackSize(FName ItemId) const;

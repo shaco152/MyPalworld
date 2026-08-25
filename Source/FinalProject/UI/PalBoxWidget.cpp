@@ -435,7 +435,7 @@ bool UPalBoxWidget::NativeOnDrop(const FGeometry& InGeometry, const FDragDropEve
 	}
 
 	// 找到该侧第一个空槽放入
-	TArray<FStoredPalInfo>& TargetArr = bToParty ? Storage->PartyPals : Storage->BoxPals;
+	FReplicatedStoredPalList& TargetArr = bToParty ? Storage->PartyPals : Storage->BoxPals;
 	int32 EmptyIndex = INDEX_NONE;
 	for (int32 i = 0; i < TargetArr.Num(); ++i)
 	{

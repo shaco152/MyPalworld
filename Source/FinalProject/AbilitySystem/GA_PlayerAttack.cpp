@@ -7,10 +7,12 @@
 #include "GameFramework/Controller.h"
 #include "GameFramework/Pawn.h"
 #include "Items/HitReactInterface.h"
+#include "Characters/PlayerCharacter.h"
 
 UGA_PlayerAttack::UGA_PlayerAttack()
 {
 	InstancingPolicy = EGameplayAbilityInstancingPolicy::InstancedPerActor;
+	NetExecutionPolicy = EGameplayAbilityNetExecutionPolicy::ServerOnly;
 	// 与输入标签绑定（同投掷能力模式）
 	AbilityTags.AddTag(CaptureTags::TAG_InputTag_Attack.GetTag());
 	ActivationOwnedTags.AddTag(CaptureTags::TAG_InputTag_Attack.GetTag());
@@ -41,11 +43,11 @@ void UGA_PlayerAttack::ActivateAbility(const FGameplayAbilitySpecHandle Handle, 
 	}
 
 	// 攻击动画（无 AnimInstance 时 PlayAnimMontage 内部安全跳过）
-	if (ACharacter* AvatarChar = Cast<ACharacter>(Avatar))
+	if (APlayerCharacter* PlayerCharacter = Cast<APlayerCharacter>(Avatar))
 	{
 		if (AttackMontage)
 		{
-			AvatarChar->PlayAnimMontage(AttackMontage);
+			PlayerCharacter->PlayAttackMontageReplicated(AttackMontage);
 		}
 	}
 

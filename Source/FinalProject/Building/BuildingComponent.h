@@ -90,6 +90,8 @@ public:
 	TArray<FName> GetRecipeIds() const;
 	UItemInventoryComponent* GetInventory() const;
 	UDataTable* GetBuildingCatalog() const { return BuildingCatalog; }
+	/** Possess/PlayerState 到达后重绑长期数据源；可重复调用。 */
+	void RefreshDataSource();
 
 protected:
 	virtual void BeginPlay() override;

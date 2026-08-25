@@ -4,6 +4,7 @@
 #include "Components/ActorComponent.h"
 #include "Characters/PalCharacter.h" // TSubclassOf<APalCharacter> 的 UPROPERTY 反射需要完整类型
 #include "Engine/TimerHandle.h"
+#include "Net/Serialization/FastArraySerializer.h"
 #include "PalStorageComponent.generated.h"
 
 class UPalAttributeSet;
@@ -11,12 +12,19 @@ class UTexture2D;
 
 /** 背包/仓库中一只帕鲁的存档信息（空槽 = PalClass 为 null） */
 USTRUCT(BlueprintType)
-struct FINALPROJECT_API FStoredPalInfo
+struct FINALPROJECT_API FStoredPalInfo : public FFastArraySerializerItem
 {
 	GENERATED_BODY()
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pal")
 	TSubclassOf<APalCharacter> PalClass;
+
+	/** 稳定定义 ID（DT_PalDefinitions 行名）与服务器生成的实例 ID。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pal|Persistence")
+	FName PalDefinitionId = NAME_None;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pal|Persistence")
+	FGuid PalInstanceId;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pal")
 	float Level = 1.f;
@@ -44,10 +52,87 @@ struct FINALPROJECT_API FStoredPalInfo
 	bool IsValid() const { return PalClass != nullptr; }
 };
 
+class UPalStorageComponent;
+
+USTRUCT(BlueprintType)
+struct FINALPROJECT_API FReplicatedStoredPalList : public FFastArraySerializer
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "PalStorage")
+	TArray<FStoredPalInfo> Items;
+
+	bool NetDeltaSerialize(FNetDeltaSerializeInfo& DeltaParams)
+	{
+		return FFastArraySerializer::FastArrayDeltaSerialize<FStoredPalInfo, FReplicatedStoredPalList>(Items, DeltaParams, *this);
+	}
+
+	void PostReplicatedReceive(const FFastArraySerializer::FPostReplicatedReceiveParameters& Parameters);
+	int32 Num() const { return Items.Num(); }
+	bool IsValidIndex(int32 Index) const { return Items.IsValidIndex(Index); }
+	void SetNum(int32 Count) { Items.SetNum(Count); }
+	FStoredPalInfo& operator[](int32 Index) { return Items[Index]; }
+	const FStoredPalInfo& operator[](int32 Index) const { return Items[Index]; }
+	auto begin() { return Items.begin(); }
+	auto end() { return Items.end(); }
+	auto begin() const { return Items.begin(); }
+	auto end() const { return Items.end(); }
+	void Swap(int32 A, int32 B)
+	{
+		if (A == B || !Items.IsValidIndex(A) || !Items.IsValidIndex(B)) return;
+		// 复制 ID 表示固定槽位而不是帕鲁实体；交换 payload 后恢复每个槽位原 ID，客户端才会更新对应索引。
+		const int32 AId = Items[A].ReplicationID;
+		const int32 AKey = Items[A].ReplicationKey;
+		const int32 AMostRecentKey = Items[A].MostRecentArrayReplicationKey;
+		const int32 BId = Items[B].ReplicationID;
+		const int32 BKey = Items[B].ReplicationKey;
+		const int32 BMostRecentKey = Items[B].MostRecentArrayReplicationKey;
+		Items.Swap(A, B);
+		Items[A].ReplicationID = AId;
+		Items[A].ReplicationKey = AKey;
+		Items[A].MostRecentArrayReplicationKey = AMostRecentKey;
+		Items[B].ReplicationID = BId;
+		Items[B].ReplicationKey = BKey;
+		Items[B].MostRecentArrayReplicationKey = BMostRecentKey;
+		MarkItemDirty(Items[A]);
+		MarkItemDirty(Items[B]);
+	}
+	/**
+	 * 蓝图组件模板可能带有未复制的固定空槽（ReplicationID == INDEX_NONE）。
+	 * 客户端必须移除这些本地占位项，让 Fast Array 独占数组结构；同时清空索引缓存，
+	 * 避免后续增量包继续引用删除前的本地索引。
+	 */
+	int32 RemoveUnreplicatedLocalItems()
+	{
+		const int32 Removed = Items.RemoveAll([](const FStoredPalInfo& Item)
+		{
+			return Item.ReplicationID == INDEX_NONE;
+		});
+		if (Removed > 0)
+		{
+			ItemMap.Reset();
+		}
+		return Removed;
+	}
+	void MarkAllDirty()
+	{
+		MarkArrayDirty();
+		for (FStoredPalInfo& Item : Items) MarkItemDirty(Item);
+	}
+
+	UPalStorageComponent* Owner = nullptr;
+};
+
+template<>
+struct TStructOpsTypeTraits<FReplicatedStoredPalList> : public TStructOpsTypeTraitsBase2<FReplicatedStoredPalList>
+{
+	enum { WithNetDeltaSerializer = true };
+};
+
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnStorageChanged);
 
 /**
- * 帕鲁存储组件（挂在 APlayerCharacter 上）：
+ * 帕鲁存储组件（长期数据挂在 AFinalProjectPlayerState 上）：
  * 背包固定 5 槽 + 仓库 BoxCapacity 槽，捕捉入库优先进背包，
  * 提供拖放交换、左右切换当前槽、召唤/收回（F 键切换式，召唤保留槽位）等操作，
  * 每次变更广播 OnStorageChanged 供 HUD / 仓库 UI 刷新。
@@ -59,19 +144,20 @@ class FINALPROJECT_API UPalStorageComponent : public UActorComponent
 
 public:
 	UPalStorageComponent();
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	// 背包容量（需求硬性规定最多携带 5 只）
 	static constexpr int32 PartyCapacity = 5;
 
 	// 背包 5 槽 / 仓库容量个槽（空槽 IsValid()==false）
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "PalStorage")
-	TArray<FStoredPalInfo> PartyPals;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Replicated, Category = "PalStorage")
+	FReplicatedStoredPalList PartyPals;
 
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "PalStorage")
-	TArray<FStoredPalInfo> BoxPals;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Replicated, Category = "PalStorage")
+	FReplicatedStoredPalList BoxPals;
 
 	// 当前选中的背包槽（左右键切换，F 召唤取它）
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "PalStorage")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, ReplicatedUsing = HandleReplicatedStorage, Category = "PalStorage")
 	int32 ActivePartyIndex = 0;
 
 	// 仓库容量（槽数，蓝图中可调）
@@ -116,7 +202,7 @@ public:
 	void RecallSummonedPal();
 
 	// 出战状态查询（UI 用于禁止把出战帕鲁拖进仓库、显示出战标识）
-	bool HasSummonedPal() const { return SummonedPal.IsValid(); }
+	bool HasSummonedPal() const { return IsValid(SummonedPal); }
 	int32 GetSummonedPartyIndex() const { return SummonedPartyIndex; }
 
 	// 出战帕鲁阵亡回调（APalCharacter::HandleDeath 调用）：回写 HP=0 到槽位快照并销毁实体
@@ -132,12 +218,29 @@ public:
 	// 读取帕鲁类的可学技能池（BP 配置的 LearnableSkillRowNames）
 	static TArray<FName> GetLearnablePoolFor(const FStoredPalInfo& Info);
 
+	/** 存档恢复专用：Authority 一次性替换快照并广播。 */
+	void RestoreSnapshot(const TArray<FStoredPalInfo>& InParty, const TArray<FStoredPalInfo>& InBox, int32 InActiveIndex);
+	UFUNCTION()
+	void HandleReplicatedStorage();
+
 protected:
 	virtual void BeginPlay() override;
 
+	UFUNCTION(Server, Reliable)
+	void ServerSwapSlots(bool bFromParty, int32 FromIndex, bool bToParty, int32 ToIndex);
+
+	UFUNCTION(Server, Reliable)
+	void ServerCycleActiveIndex(int32 Delta);
+
+	UFUNCTION(Server, Reliable)
+	void ServerSummonOrRecall();
+
+	UFUNCTION(Server, Reliable)
+	void ServerSetPalSkill(int32 PartyIndex, int32 SlotIndex, FName SkillRowName);
+
 private:
 	// 尝试放入指定数组第一个空槽（成功落盘+广播，返回 true）
-	bool TryAddToArray(TArray<FStoredPalInfo>& Array, const FStoredPalInfo& Info, const TCHAR* ArrayName);
+	bool TryAddToArray(FReplicatedStoredPalList& Array, const FStoredPalInfo& Info, const TCHAR* ArrayName);
 
 	// 存储回血：单个槽按比例回血（满血返回 false）
 	bool ApplyStoredRegen(FStoredPalInfo& Info);
@@ -150,8 +253,14 @@ private:
 
 	// 按容量保证数组槽数（BP 里改 BoxCapacity 后构造期拿不到，BeginPlay 校正）
 	void EnsureSlotCounts();
+	void NotifyStorageChanged();
+	APawn* GetOwningPawn() const;
+	bool PreparePersistentIdentity(FStoredPalInfo& Info);
 
 	// 当前出战的帕鲁（Weak 指针避免强引用阻止销毁）与其来源槽位
-	TWeakObjectPtr<APalCharacter> SummonedPal;
+	UPROPERTY(ReplicatedUsing = HandleReplicatedStorage)
+	TObjectPtr<APalCharacter> SummonedPal;
+
+	UPROPERTY(ReplicatedUsing = HandleReplicatedStorage)
 	int32 SummonedPartyIndex = INDEX_NONE;
 };

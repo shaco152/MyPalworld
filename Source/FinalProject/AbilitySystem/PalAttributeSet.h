@@ -22,24 +22,25 @@ class FINALPROJECT_API UPalAttributeSet : public UAttributeSet
 
 public:
 	UPalAttributeSet();
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	// 注意：这里标 EditAnywhere 也没用——FGameplayAttributeData 内部的 BaseValue/CurrentValue
 	// 在引擎里是 protected + BlueprintReadOnly，详情面板不可编辑。数值配置走 APalCharacter 的
 	// InitialHealth/InitialMaxHealth/InitialLevel 普通 float（InitAbilitySystem 时写入属性集）。
-	UPROPERTY(BlueprintReadOnly, Category = "Pal|Attributes")
+	UPROPERTY(BlueprintReadOnly, ReplicatedUsing = OnRep_Health, Category = "Pal|Attributes")
 	FGameplayAttributeData Health;
 	ATTRIBUTE_ACCESSORS(UPalAttributeSet, Health);
 
-	UPROPERTY(BlueprintReadOnly, Category = "Pal|Attributes")
+	UPROPERTY(BlueprintReadOnly, ReplicatedUsing = OnRep_MaxHealth, Category = "Pal|Attributes")
 	FGameplayAttributeData MaxHealth;
 	ATTRIBUTE_ACCESSORS(UPalAttributeSet, MaxHealth);
 
-	UPROPERTY(BlueprintReadOnly, Category = "Pal|Attributes")
+	UPROPERTY(BlueprintReadOnly, ReplicatedUsing = OnRep_Level, Category = "Pal|Attributes")
 	FGameplayAttributeData Level;
 	ATTRIBUTE_ACCESSORS(UPalAttributeSet, Level);
 
 	// 当前捕捉概率（0~1），由 UGE_CaptureChance + UCaptureChanceExecCalc 计算后覆写
-	UPROPERTY(BlueprintReadOnly, Category = "Pal|Attributes")
+	UPROPERTY(BlueprintReadOnly, ReplicatedUsing = OnRep_CaptureChance, Category = "Pal|Attributes")
 	FGameplayAttributeData CaptureChance;
 	ATTRIBUTE_ACCESSORS(UPalAttributeSet, CaptureChance);
 
@@ -48,14 +49,28 @@ public:
 	FOnPalHealthChanged OnHealthChanged;
 
 	// MP（回合制技能消耗；自由战斗普攻不耗 MP）
-	UPROPERTY(BlueprintReadOnly, Category = "Pal|Attributes")
+	UPROPERTY(BlueprintReadOnly, ReplicatedUsing = OnRep_MP, Category = "Pal|Attributes")
 	FGameplayAttributeData MP;
 	ATTRIBUTE_ACCESSORS(UPalAttributeSet, MP);
 
-	UPROPERTY(BlueprintReadOnly, Category = "Pal|Attributes")
+	UPROPERTY(BlueprintReadOnly, ReplicatedUsing = OnRep_MaxMP, Category = "Pal|Attributes")
 	FGameplayAttributeData MaxMP;
 	ATTRIBUTE_ACCESSORS(UPalAttributeSet, MaxMP);
 
 	// 伤害/治疗/耗蓝 GE 结算后钳制（HP→[0,MaxHealth]，MP→[0,MaxMP]）
 	virtual void PostGameplayEffectExecute(const FGameplayEffectModCallbackData& Data) override;
+
+protected:
+	UFUNCTION()
+	void OnRep_Health(const FGameplayAttributeData& OldValue);
+	UFUNCTION()
+	void OnRep_MaxHealth(const FGameplayAttributeData& OldValue);
+	UFUNCTION()
+	void OnRep_Level(const FGameplayAttributeData& OldValue);
+	UFUNCTION()
+	void OnRep_CaptureChance(const FGameplayAttributeData& OldValue);
+	UFUNCTION()
+	void OnRep_MP(const FGameplayAttributeData& OldValue);
+	UFUNCTION()
+	void OnRep_MaxMP(const FGameplayAttributeData& OldValue);
 };

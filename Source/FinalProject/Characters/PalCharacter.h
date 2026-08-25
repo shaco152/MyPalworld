@@ -15,6 +15,15 @@ class UWidgetComponent;
 class UPalHPBarWidget;
 class UAnimMontage;
 
+/** 服务器权威捕捉状态；复制到客户端以驱动隐藏、碰撞和移动表现。 */
+UENUM()
+enum class EPalCaptureNetState : uint8
+{
+	None,
+	Capturing,
+	Captured
+};
+
 /**
  * 帕鲁基类：继承 ACharacter（保留现有蓝图的移动/动画能力），
  * 持有 ASC + 属性集，实现可捕捉接口。
@@ -26,6 +35,7 @@ class FINALPROJECT_API APalCharacter : public ACharacter, public IAbilitySystemI
 
 public:
 	APalCharacter();
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	// IAbilitySystemInterface
 	virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;
@@ -63,7 +73,7 @@ public:
 
 	// 运行时技能槽（4 个：0 普攻 + 3 学习；召唤时从 FStoredPalInfo 恢复，空则取 DefaultSkillRowNames）
 	const TArray<FName>& GetSkillRowNames() const { return SkillRowNames; }
-	void SetSkillRowNames(const TArray<FName>& InSkills) { SkillRowNames = InSkills; }
+	void SetSkillRowNames(const TArray<FName>& InSkills);
 
 	// 技能表资产（DT_PalSkills，BP 里设置；自由战斗普攻与回合制技能结算都读它）
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Pal|Skills")
@@ -156,9 +166,22 @@ private:
 	void UpdateHPBarPercent();
 
 	// 运行时技能槽（见 GetSkillRowNames 说明）
+	UPROPERTY(ReplicatedUsing = OnRep_SkillRowNames)
 	TArray<FName> SkillRowNames;
 
+	UPROPERTY(Replicated)
 	bool bIsDead = false;
+
+	UPROPERTY(ReplicatedUsing = OnRep_CaptureNetState)
+	EPalCaptureNetState CaptureNetState = EPalCaptureNetState::None;
+
+	UFUNCTION()
+	void OnRep_SkillRowNames();
+
+	UFUNCTION()
+	void OnRep_CaptureNetState();
+
+	void ApplyCaptureNetState();
 
 	// 回合制强制显示血条（忽略战斗状态广播）
 	bool bHPBarForcedVisible = false;

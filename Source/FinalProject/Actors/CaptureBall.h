@@ -36,6 +36,7 @@ public:
 	ACaptureBall();
 
 	virtual void Tick(float DeltaSeconds) override;
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	// 捕捉控件绑定这两个委托来显示概率与判定结果
 	UPROPERTY(BlueprintAssignable, Category = "Capture")
@@ -86,16 +87,25 @@ protected:
 	void HandleHit(UPrimitiveComponent* HitComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, FVector NormalImpulse, const FHitResult& Hit);
 
 private:
+	UFUNCTION()
+	void OnRep_CapturePresentation();
+
+	void ApplyCapturePresentation();
+	void UpdateShakePresentation(float DeltaSeconds);
+	void ResetMeshPresentation();
 	void StartCapture(AActor* Pal, const FHitResult& Hit);
 	void ApplyCaptureOutcome();
 
+	UPROPERTY(ReplicatedUsing = OnRep_CapturePresentation)
 	ECaptureBallState State = ECaptureBallState::Flying;
 	TWeakObjectPtr<AActor> CapturedPal;
 	TWeakObjectPtr<UCaptureWidget> CaptureWidgetRef; // 控件实例（球的 Tick 驱动其平滑填充）
 	FVector HitLocation = FVector::ZeroVector;
-	FVector HoverLocation = FVector::ZeroVector;      // 悬停点（晃动围绕它）
 	FVector PalOriginalLocation = FVector::ZeroVector; // 捕捉前帕鲁位置（失败复位用，避免跳到命中点）
-	float BaseYaw = 0.f;                               // 捕捉时球的基础偏航（避免旋转突跳）
+	FTransform MeshInitialRelativeTransform;
+	ECaptureBallState LastPresentationState = ECaptureBallState::Flying;
+	float PresentationShakeElapsed = 0.f;
+	UPROPERTY(ReplicatedUsing = OnRep_CapturePresentation)
 	float CaptureChance = 0.f;   // 当前阶段判定概率（第一次成功后提高）
 	float RollValue = 0.f;       // 最近一次判定值
 	bool bCaptureSucceeded = false; // 最终结果（两次判定）

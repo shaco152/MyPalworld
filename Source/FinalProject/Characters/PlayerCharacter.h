@@ -27,15 +27,16 @@ class FINALPROJECT_API APlayerCharacter : public ACharacter, public IAbilitySyst
 
 public:
 	APlayerCharacter();
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	// IAbilitySystemInterface
 	virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;
 
 	// 帕鲁存储组件（背包 5 槽 + 仓库），捕捉入库 / 召唤都走它
-	UPalStorageComponent* GetStorageComponent() const { return StorageComponent; }
+	UPalStorageComponent* GetStorageComponent() const;
 
 	// 通用可堆叠物品背包（当前材料拾取/建造消耗使用）
-	UItemInventoryComponent* GetItemInventoryComponent() const { return ItemInventory; }
+	UItemInventoryComponent* GetItemInventoryComponent() const;
 
 	// 建造目录、虚影、旋转、校验与放置状态机
 	UBuildingComponent* GetBuildingComponent() const { return BuildingComponent; }
@@ -53,6 +54,7 @@ public:
 	// 死亡处理（自由战斗被野帕鲁打死 / 回合制战败）：3 秒后在 PlayerStart 重生
 	void HandleDeath();
 	bool IsDead() const { return bIsDead; }
+	void PlayAttackMontageReplicated(class UAnimMontage* Montage);
 
 	// 授予的攻击能力类（鼠标左键普攻，默认 C++ 类）
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "AbilitySystem")
@@ -76,13 +78,6 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Combat")
 	TObjectPtr<UTurnBattleComponent> TurnBattle;
 
-	// 帕鲁存储（背包/仓库数据），BP_PlayerCharacter 组件面板可直接改容量/预填测试数据
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "PalStorage")
-	TObjectPtr<UPalStorageComponent> StorageComponent;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Inventory")
-	TObjectPtr<UItemInventoryComponent> ItemInventory;
-
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Building")
 	TObjectPtr<UBuildingComponent> BuildingComponent;
 
@@ -99,6 +94,14 @@ protected:
 	TSubclassOf<UGameplayAbility> ThrowAbilityClass;
 
 private:
+	UFUNCTION()
+	void OnRep_IsDead();
+
+	UFUNCTION(NetMulticast, Unreliable)
+	void MulticastPlayAttackMontage(UAnimMontage* Montage);
+
+	void ApplyDeathPresentation();
+
 	// 3 秒重生计时器
 	void Respawn();
 
@@ -107,6 +110,7 @@ private:
 
 	void InitAbilitySystem();
 
+	UPROPERTY(ReplicatedUsing = OnRep_IsDead)
 	bool bIsDead = false;
 	FTimerHandle RespawnTimer;
 };

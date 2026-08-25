@@ -23,6 +23,7 @@ public:
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	void InitializePlacedBuilding(FName InBuildingTypeId);
+	void InitializePersistentBuilding(FName InBuildingTypeId, const FGuid& InPersistentId, const FGuid& InOwnerPlayerId);
 	void SetPlacementPreview(bool bPreview, bool bCanPlace);
 
 	UFUNCTION(BlueprintPure, Category = "Building")
@@ -30,6 +31,7 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "Building")
 	FGuid GetPersistentId() const { return PersistentId; }
+	FGuid GetOwnerPlayerId() const { return OwnerPlayerId; }
 
 	UFUNCTION(BlueprintPure, Category = "Building")
 	bool IsPlacementPreview() const { return bPlacementPreview; }
@@ -39,6 +41,7 @@ public:
 
 protected:
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Building")
 	TObjectPtr<USceneComponent> SceneRoot;
@@ -59,6 +62,9 @@ protected:
 
 	UPROPERTY(Replicated, VisibleInstanceOnly, BlueprintReadOnly, Category = "Building|Persistence")
 	FName BuildingTypeId = NAME_None;
+
+	UPROPERTY(Replicated, VisibleInstanceOnly, BlueprintReadOnly, Category = "Building|Persistence")
+	FGuid OwnerPlayerId;
 
 private:
 	void ApplyPreviewMaterial(bool bCanPlace);

@@ -12,11 +12,15 @@
 #include "Engine/Engine.h"
 #include "GameFramework/ProjectileMovementComponent.h"
 #include "Storage/PalStorageComponent.h"
+#include "Framework/PlayerDataLibrary.h"
 #include "UI/CaptureWidget.h"
+#include "Net/UnrealNetwork.h"
 
 ACaptureBall::ACaptureBall()
 {
 	PrimaryActorTick.bCanEverTick = true;
+	bReplicates = true;
+	SetReplicateMovement(true);
 
 	CollisionComp = CreateDefaultSubobject<USphereComponent>(TEXT("Collision"));
 	CollisionComp->InitSphereRadius(12.f);
@@ -53,6 +57,18 @@ ACaptureBall::ACaptureBall()
 void ACaptureBall::BeginPlay()
 {
 	Super::BeginPlay();
+	if (MeshComp)
+	{
+		MeshInitialRelativeTransform = MeshComp->GetRelativeTransform();
+	}
+
+	// 复制代理只消费服务端 Actor Transform；ProjectileMovement 不参与网络预测，
+	// 若客户端也 Tick 会和 ReplicatedMovement 同时驱动根组件，产生飞行/停球抖动。
+	if (!HasAuthority() && ProjectileMovement)
+	{
+		ProjectileMovement->Deactivate();
+		ProjectileMovement->SetComponentTickEnabled(false);
+	}
 
 	CollisionComp->OnComponentHit.AddDynamic(this, &ACaptureBall::HandleHit);
 
@@ -78,27 +94,35 @@ void ACaptureBall::BeginPlay()
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[诊断] CaptureBall::BeginPlay %s: WidgetComp 未设置 Widget Class！请在 BP_CaptureBall 的 WidgetComp 组件上设置"), *GetName());
 	}
+	ApplyCapturePresentation();
+}
+
+void ACaptureBall::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	DOREPLIFETIME(ACaptureBall, State);
+	DOREPLIFETIME(ACaptureBall, CaptureChance);
 }
 
 void ACaptureBall::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+	UpdateShakePresentation(DeltaSeconds);
 
 	// 由球的 Tick 驱动控件概率平滑填充（Capturing/Succeeding 阶段持续，UserWidget 自身 Tick 不可靠）
 	if ((State == ECaptureBallState::Capturing || State == ECaptureBallState::Succeeding) && CaptureWidgetRef.IsValid())
 	{
 		CaptureWidgetRef->TickFill(DeltaSeconds);
 	}
+	if (!HasAuthority())
+	{
+		return; // 客户端只播放复制来的移动和 UI；随机判定、状态推进与结算仅服务器执行。
+	}
 
 	if (State == ECaptureBallState::Capturing)
 	{
 		ShakeElapsed += DeltaSeconds;
 		const float Alpha = FMath::Clamp(ShakeElapsed / FMath::Max(ShakeDuration, KINDA_SMALL_NUMBER), 0.f, 1.f);
-		// 正弦震荡 + 随时间衰减：上下浮动 + 绕基础偏航摇摆（球体纯旋转不可见，浮动才是"晃动"）
-		const float Wave = FMath::Sin(ShakeElapsed * ShakeFrequency * 2.f * PI) * (1.f - Alpha);
-		const FVector NewLocation = HoverLocation + FVector(0.f, 0.f, Wave * ShakeBobAmplitude);
-		const FRotator NewRotation(0.f, BaseYaw + Wave * ShakeAmplitudeDegrees, 0.f);
-		SetActorLocationAndRotation(NewLocation, NewRotation, false, nullptr, ETeleportType::None);
 
 		if (Alpha >= 1.f)
 		{
@@ -156,7 +180,7 @@ void ACaptureBall::Tick(float DeltaSeconds)
 
 void ACaptureBall::HandleHit(UPrimitiveComponent* HitComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, FVector NormalImpulse, const FHitResult& Hit)
 {
-	if (State != ECaptureBallState::Flying)
+	if (!HasAuthority() || State != ECaptureBallState::Flying)
 	{
 		return;
 	}
@@ -228,8 +252,6 @@ void ACaptureBall::StartCapture(AActor* Pal, const FHitResult& Hit)
 	State = ECaptureBallState::Capturing;
 	HitLocation = Hit.Location;
 	CapturedPal = Pal;
-	HoverLocation = GetActorLocation();
-	BaseYaw = GetActorRotation().Yaw;
 	PalOriginalLocation = Pal->GetActorLocation();
 
 	// 立即悬停：停止投射物模拟（5.4 签名需要传入命中结果）
@@ -257,6 +279,85 @@ void ACaptureBall::StartCapture(AActor* Pal, const FHitResult& Hit)
 
 	// 判定不在命中时做，而在每次晃动结束时（Tick 里逐阶段判定）
 	OnCaptureStarted.Broadcast(CaptureChance);
+	ForceNetUpdate();
+}
+
+void ACaptureBall::OnRep_CapturePresentation()
+{
+	ApplyCapturePresentation();
+}
+
+void ACaptureBall::ApplyCapturePresentation()
+{
+	if (LastPresentationState != State)
+	{
+		LastPresentationState = State;
+		PresentationShakeElapsed = 0.f;
+		if (State != ECaptureBallState::Capturing)
+		{
+			ResetMeshPresentation();
+		}
+		if (!HasAuthority())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[诊断] CaptureBall 客户端表现状态: Ball=%s State=%d（本地 Mesh 动画）"),
+				*GetName(), static_cast<int32>(State));
+		}
+	}
+
+	if (State == ECaptureBallState::Capturing || State == ECaptureBallState::Succeeding)
+	{
+		if (WidgetComp)
+		{
+			WidgetComp->SetHiddenInGame(false);
+		}
+		if (CaptureWidgetRef.IsValid())
+		{
+			CaptureWidgetRef->SetCaptureChance(CaptureChance);
+			if (State == ECaptureBallState::Succeeding)
+			{
+				CaptureWidgetRef->ShowSuccessFill();
+			}
+		}
+	}
+}
+
+void ACaptureBall::UpdateShakePresentation(float DeltaSeconds)
+{
+	// 捕捉逻辑和随机判定仍只在服务器；摇晃只是每台机器的本地表现，
+	// 不再逐帧修改/复制根 Actor Transform，避免网络采样造成的锯齿和回拉。
+	if (LastPresentationState != State)
+	{
+		LastPresentationState = State;
+		PresentationShakeElapsed = 0.f;
+		if (State != ECaptureBallState::Capturing)
+		{
+			ResetMeshPresentation();
+		}
+	}
+	if (State != ECaptureBallState::Capturing || !MeshComp)
+	{
+		return;
+	}
+
+	PresentationShakeElapsed += DeltaSeconds;
+	const float PhaseDuration = FMath::Max(ShakeDuration, KINDA_SMALL_NUMBER);
+	const float PhaseElapsed = FMath::Fmod(PresentationShakeElapsed, PhaseDuration);
+	const float Alpha = FMath::Clamp(PhaseElapsed / PhaseDuration, 0.f, 1.f);
+	const float Wave = FMath::Sin(PhaseElapsed * ShakeFrequency * 2.f * PI) * (1.f - Alpha);
+
+	FVector RelativeLocation = MeshInitialRelativeTransform.GetLocation();
+	RelativeLocation.Z += Wave * ShakeBobAmplitude;
+	FRotator RelativeRotation = MeshInitialRelativeTransform.Rotator();
+	RelativeRotation.Yaw += Wave * ShakeAmplitudeDegrees;
+	MeshComp->SetRelativeLocationAndRotation(RelativeLocation, RelativeRotation);
+}
+
+void ACaptureBall::ResetMeshPresentation()
+{
+	if (MeshComp)
+	{
+		MeshComp->SetRelativeTransform(MeshInitialRelativeTransform);
+	}
 }
 
 void ACaptureBall::ApplyCaptureOutcome()
@@ -300,13 +401,13 @@ void ACaptureBall::ApplyCaptureOutcome()
 			{
 				Thrower = Cast<APawn>(GetOwner());
 			}
-			if (UPalStorageComponent* Storage = Thrower ? Thrower->FindComponentByClass<UPalStorageComponent>() : nullptr)
+			if (UPalStorageComponent* Storage = UPlayerDataLibrary::ResolvePalStorage(Thrower))
 			{
 				Storage->AddCapturedPal(Info);
 			}
 			else
 			{
-				UE_LOG(LogTemp, Warning, TEXT("[诊断] ApplyCaptureOutcome: 投掷者 %s 上没有 UPalStorageComponent，帕鲁数据丢失"),
+				UE_LOG(LogTemp, Warning, TEXT("[诊断] ApplyCaptureOutcome: 投掷者 %s 的 PlayerState 无 UPalStorageComponent，帕鲁数据丢失"),
 					*GetNameSafe(Thrower));
 			}
 		}

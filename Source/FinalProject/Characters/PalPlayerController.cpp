@@ -15,12 +15,20 @@
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerState.h"
 #include "Storage/PalStorageComponent.h"
 #include "Items/ItemInventoryComponent.h"
+#include "Framework/PlayerDataLibrary.h"
+#include "Framework/FinalProjectGameState.h"
+#include "Framework/FinalProjectGameInstance.h"
+#include "Online/PalSessionSubsystem.h"
+#include "Persistence/SaveGameSubsystem.h"
 #include "UI/BuildMenuWidget.h"
+#include "UI/GameplayMenuWidget.h"
 #include "UI/MaterialInventoryWidget.h"
 #include "UI/PalBoxWidget.h"
 #include "UI/PalHUDWidget.h"
+#include "HAL/PlatformTime.h"
 
 APalPlayerController::APalPlayerController()
 {
@@ -29,6 +37,16 @@ APalPlayerController::APalPlayerController()
 void APalPlayerController::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// 从主菜单 OpenLevel 进入 Gameplay 时，视口可能仍保留 UIOnly；新 Gameplay PC 必须显式恢复游戏输入。
+	if (IsLocalController())
+	{
+		SetInputMode(FInputModeGameOnly());
+		SetShowMouseCursor(false);
+		SetIgnoreMoveInput(false);
+		SetIgnoreLookInput(false);
+		UE_LOG(LogTemp, Warning, TEXT("[诊断] Gameplay PlayerController 已恢复 GameOnly 输入模式"));
+	}
 
 	// 注册输入映射上下文（控制器级，不依赖 Pawn 的生成时机）
 	if (UEnhancedInputLocalPlayerSubsystem* Subsystem = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(GetLocalPlayer()))
@@ -46,6 +64,27 @@ void APalPlayerController::BeginPlay()
 	// 懒建背包 HUD（此时 Pawn 可能尚未生成，OnPossess 会兜底再试一次）
 	CreateHUDIfNeeded();
 	BindBuildingComponent();
+}
+
+void APalPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	if (USaveGameSubsystem* Saves = GetGameInstance() ? GetGameInstance()->GetSubsystem<USaveGameSubsystem>() : nullptr)
+	{
+		Saves->OnSaveFinished.RemoveDynamic(this, &APalPlayerController::HandleManualSaveFinished);
+		Saves->OnSaveFinished.RemoveDynamic(this, &APalPlayerController::HandleOpenMultiplayerSaveFinished);
+	}
+	if (UPalSessionSubsystem* Sessions = GetGameInstance() ? GetGameInstance()->GetSubsystem<UPalSessionSubsystem>() : nullptr)
+	{
+		Sessions->OnOperationFinished.RemoveDynamic(this, &APalPlayerController::HandleOpenMultiplayerSessionFinished);
+	}
+	if (GameplayMenuWidget)
+	{
+		GameplayMenuWidget->RemoveFromParent();
+	}
+	bGameplayMenuOpen = false;
+	bManualSavePending = false;
+	bOpenMultiplayerPending = false;
+	Super::EndPlay(EndPlayReason);
 }
 
 void APalPlayerController::OnPossess(APawn* InPawn)
@@ -302,13 +341,22 @@ bool APalPlayerController::IsGameplayInputBlocked() const
 
 bool APalPlayerController::IsMovementInputBlocked() const
 {
+	if (const AFinalProjectGameState* ProjectGameState = GetWorld() ? GetWorld()->GetGameState<AFinalProjectGameState>() : nullptr;
+		ProjectGameState && ProjectGameState->GetLoadState() != EWorldLoadState::Ready)
+	{
+		return true;
+	}
 	if (bBoxOpen || bMaterialInventoryOpen)
+	{
+		return true;
+	}
+	if (bGameplayMenuOpen)
 	{
 		return true;
 	}
 	if (const APlayerCharacter* PlayerPawn = Cast<APlayerCharacter>(GetPawn()))
 	{
-		if (PlayerPawn->IsInTurnBattle())
+		if (PlayerPawn->IsDead() || PlayerPawn->IsInTurnBattle())
 		{
 			return true;
 		}
@@ -438,41 +486,64 @@ void APalPlayerController::OnSprintPressed()
 		return;
 	}
 
-	if (ACharacter* ControlledCharacter = Cast<ACharacter>(GetPawn()))
+	ApplySprintSpeed(true);
+	if (!HasAuthority())
 	{
-		if (UCharacterMovementComponent* MoveComp = ControlledCharacter->GetCharacterMovement())
-		{
-			MoveComp->MaxWalkSpeed = SprintSpeed;
-		}
+		ServerSetSprinting(true);
 	}
 }
 
 void APalPlayerController::OnSprintReleased()
 {
-	if (IsMovementInputBlocked())
+	// 松开必须无条件恢复；若打开 UI/进入战斗导致输入被阻断，不能把冲刺速度遗留在角色上。
+	ApplySprintSpeed(false);
+	if (!HasAuthority())
 	{
-		return;
+		ServerSetSprinting(false);
 	}
+}
 
+void APalPlayerController::ApplySprintSpeed(bool bSprinting)
+{
 	if (ACharacter* ControlledCharacter = Cast<ACharacter>(GetPawn()))
 	{
 		if (UCharacterMovementComponent* MoveComp = ControlledCharacter->GetCharacterMovement())
 		{
-			MoveComp->MaxWalkSpeed = WalkSpeed;
+			MoveComp->MaxWalkSpeed = bSprinting ? SprintSpeed : WalkSpeed;
 		}
 	}
 }
 
+void APalPlayerController::ServerSetSprinting_Implementation(bool bSprinting)
+{
+	// 客户端只提交布尔意图，速度值始终取服务端 BP_PC 配置，避免客户端任意传速。
+	ApplySprintSpeed(bSprinting && !IsMovementInputBlocked());
+	const ACharacter* ControlledCharacter = Cast<ACharacter>(GetPawn());
+	const UCharacterMovementComponent* MoveComp = ControlledCharacter ? ControlledCharacter->GetCharacterMovement() : nullptr;
+	UE_LOG(LogTemp, Warning, TEXT("[诊断] 服务端同步冲刺: Controller=%s Requested=%d AppliedSpeed=%.0f"),
+		*GetName(), static_cast<int32>(bSprinting), MoveComp ? MoveComp->MaxWalkSpeed : 0.f);
+}
+
 UPalStorageComponent* APalPlayerController::GetPalStorage() const
 {
-	const APawn* ControlledPawn = GetPawn();
-	return ControlledPawn ? ControlledPawn->FindComponentByClass<UPalStorageComponent>() : nullptr;
+	return UPlayerDataLibrary::ResolvePalStorage(this);
+}
+
+void APalPlayerController::OnRep_PlayerState()
+{
+	Super::OnRep_PlayerState();
+	CreateHUDIfNeeded();
+	BindBuildingComponent();
+	if (UBuildingComponent* Building = GetBuildingComponent())
+	{
+		Building->RefreshDataSource();
+	}
+	UE_LOG(LogTemp, Warning, TEXT("[诊断] PlayerController 收到 PlayerState：%s"), *GetNameSafe(PlayerState.Get()));
 }
 
 UItemInventoryComponent* APalPlayerController::GetItemInventory() const
 {
-	const APawn* ControlledPawn = GetPawn();
-	return ControlledPawn ? ControlledPawn->FindComponentByClass<UItemInventoryComponent>() : nullptr;
+	return UPlayerDataLibrary::ResolveItemInventory(this);
 }
 
 UBuildingComponent* APalPlayerController::GetBuildingComponent() const
@@ -483,6 +554,10 @@ UBuildingComponent* APalPlayerController::GetBuildingComponent() const
 
 void APalPlayerController::BindBuildingComponent()
 {
+	if (!IsLocalController())
+	{
+		return;
+	}
 	if (UBuildingComponent* Building = GetBuildingComponent())
 	{
 		Building->OnBuildModeStateChanged.RemoveDynamic(this, &APalPlayerController::OnBuildModeStateChanged);
@@ -492,7 +567,7 @@ void APalPlayerController::BindBuildingComponent()
 
 void APalPlayerController::CreateHUDIfNeeded()
 {
-	if (HUDWidget || !HUDWidgetClass)
+	if (!IsLocalController() || HUDWidget || !HUDWidgetClass)
 	{
 		return; // 已创建 / 未配置
 	}
@@ -519,6 +594,10 @@ void APalPlayerController::CreateHUDIfNeeded()
 
 void APalPlayerController::SetPersistentHUDVisible(bool bVisible)
 {
+	if (!IsLocalController())
+	{
+		return;
+	}
 	if (bVisible)
 	{
 		CreateHUDIfNeeded();
@@ -532,6 +611,10 @@ void APalPlayerController::SetPersistentHUDVisible(bool bVisible)
 
 void APalPlayerController::OnToggleBox()
 {
+	if (bGameplayMenuOpen)
+	{
+		return;
+	}
 	if (!bBoxOpen)
 	{
 		const UBuildingComponent* Building = GetBuildingComponent();
@@ -698,7 +781,12 @@ void APalPlayerController::OnPartyNext()
 
 void APalPlayerController::OnUIBackPressed()
 {
-	// Esc 优先取消建造/材料背包；仓库继续使用 E；主战斗页 Esc 不结束战斗。
+	// Esc 按优先级关闭当前子界面；没有子界面时打开游戏菜单。
+	if (bGameplayMenuOpen)
+	{
+		CloseGameplayMenu();
+		return;
+	}
 	if (UBuildingComponent* Building = GetBuildingComponent(); Building && Building->IsBuildModeActive())
 	{
 		Building->ExitBuildMode();
@@ -709,17 +797,28 @@ void APalPlayerController::OnUIBackPressed()
 		OnToggleMaterialInventory();
 		return;
 	}
+	if (bBoxOpen)
+	{
+		OnToggleBox();
+		return;
+	}
 	if (const APlayerCharacter* PlayerPawn = Cast<APlayerCharacter>(GetPawn()))
 	{
 		if (UTurnBattleComponent* Battle = PlayerPawn->GetTurnBattleComponent(); Battle && Battle->IsSwitchPanelVisible())
 		{
 			Battle->CancelSwitchSelection();
+			return;
 		}
 	}
+	OpenGameplayMenu();
 }
 
 void APalPlayerController::OnToggleMaterialInventory()
 {
+	if (bGameplayMenuOpen)
+	{
+		return;
+	}
 	if (!bMaterialInventoryOpen)
 	{
 		const APlayerCharacter* PlayerPawn = Cast<APlayerCharacter>(GetPawn());
@@ -773,6 +872,10 @@ void APalPlayerController::OnToggleMaterialInventory()
 
 void APalPlayerController::OnToggleBuildMode()
 {
+	if (bGameplayMenuOpen)
+	{
+		return;
+	}
 	UBuildingComponent* Building = GetBuildingComponent();
 	if (!Building)
 	{
@@ -802,6 +905,10 @@ void APalPlayerController::OnBuildRotate(const FInputActionValue& Value)
 
 void APalPlayerController::OnBuildModeStateChanged(EBuildModeState NewState)
 {
+	if (!IsLocalController())
+	{
+		return;
+	}
 	if (NewState == EBuildModeState::CatalogOpen)
 	{
 		UBuildingComponent* Building = GetBuildingComponent();
@@ -850,5 +957,320 @@ void APalPlayerController::OnBuildModeStateChanged(EBuildModeState NewState)
 	else
 	{
 		SetPersistentHUDVisible(false); // Previewing：保留干净的建造视野
+	}
+}
+
+void APalPlayerController::OpenGameplayMenu()
+{
+	if (!IsLocalController() || bGameplayMenuOpen)
+	{
+		return;
+	}
+	if (!GameplayMenuWidgetClass)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[诊断] Esc 游戏菜单未配置：请在 BP_PlayerController 设置 GameplayMenuWidgetClass"));
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 8.f, FColor::Red,
+				TEXT("[诊断] BP_PlayerController 未设置 GameplayMenuWidgetClass"));
+		}
+		return;
+	}
+	if (!GameplayMenuWidget)
+	{
+		GameplayMenuWidget = CreateWidget<UGameplayMenuWidget>(this, GameplayMenuWidgetClass);
+	}
+	if (!GameplayMenuWidget)
+	{
+		return;
+	}
+
+	GameplayMenuWidget->OnResumeRequested.RemoveAll(this);
+	GameplayMenuWidget->OnSaveRequested.RemoveAll(this);
+	GameplayMenuWidget->OnOpenMultiplayerRequested.RemoveAll(this);
+	GameplayMenuWidget->OnReturnToMainMenuRequested.RemoveAll(this);
+	GameplayMenuWidget->OnResumeRequested.AddUObject(this, &APalPlayerController::CloseGameplayMenu);
+	GameplayMenuWidget->OnSaveRequested.AddUObject(this, &APalPlayerController::HandleManualSaveRequested);
+	GameplayMenuWidget->OnOpenMultiplayerRequested.AddUObject(this, &APalPlayerController::HandleOpenMultiplayerRequested);
+	GameplayMenuWidget->OnReturnToMainMenuRequested.AddUObject(this, &APalPlayerController::HandleReturnToMainMenuRequested);
+	GameplayMenuWidget->AddToViewport(100);
+	bGameplayMenuOpen = true;
+	GameplayMenuWidget->SetCanOpenMultiplayer(GetNetMode() == NM_Standalone);
+	const bool bMenuBusy = bManualSavePending || bOpenMultiplayerPending;
+	GameplayMenuWidget->SetBusy(bMenuBusy,
+		bOpenMultiplayerPending ? TEXT("正在开放当前世界联机...") :
+		(bManualSavePending ? TEXT("正在保存世界...") : TEXT("游戏菜单")));
+	SetPersistentHUDVisible(false);
+
+	FInputModeGameAndUI Mode;
+	// 根 UserWidget 通常不可聚焦；鼠标菜单无需强制 Focus，避免 Non-Focusable 输入错误。
+	Mode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+	Mode.SetHideCursorDuringCapture(false);
+	SetInputMode(Mode);
+	SetShowMouseCursor(true);
+	UE_LOG(LogTemp, Warning, TEXT("[诊断] Esc 游戏菜单已打开"));
+}
+
+void APalPlayerController::CloseGameplayMenu()
+{
+	if (!bGameplayMenuOpen)
+	{
+		return;
+	}
+	if (GameplayMenuWidget)
+	{
+		GameplayMenuWidget->RemoveFromParent();
+	}
+	bGameplayMenuOpen = false;
+	SetInputMode(FInputModeGameOnly());
+	SetShowMouseCursor(false);
+
+	bool bShouldShowHUD = true;
+	if (const APlayerCharacter* PlayerPawn = Cast<APlayerCharacter>(GetPawn()))
+	{
+		bShouldShowHUD = !PlayerPawn->IsInTurnBattle();
+	}
+	if (const UBuildingComponent* Building = GetBuildingComponent(); Building && Building->IsBuildModeActive())
+	{
+		bShouldShowHUD = false;
+	}
+	SetPersistentHUDVisible(bShouldShowHUD);
+	UE_LOG(LogTemp, Warning, TEXT("[诊断] Esc 游戏菜单已关闭，恢复 GameOnly 输入"));
+}
+
+void APalPlayerController::HandleManualSaveRequested()
+{
+	if (!bGameplayMenuOpen || bManualSavePending || bOpenMultiplayerPending)
+	{
+		return;
+	}
+	bManualSavePending = true;
+	if (GameplayMenuWidget)
+	{
+		GameplayMenuWidget->SetBusy(true, GetNetMode() == NM_Client
+			? TEXT("正在请求主机保存世界...") : TEXT("正在保存世界..."));
+	}
+	if (HasAuthority())
+	{
+		BeginManualSaveOnServer();
+	}
+	else
+	{
+		ServerRequestManualSave();
+	}
+}
+
+void APalPlayerController::HandleOpenMultiplayerRequested()
+{
+	if (!bGameplayMenuOpen || bManualSavePending || bOpenMultiplayerPending)
+	{
+		return;
+	}
+	if (!HasAuthority() || GetNetMode() != NM_Standalone)
+	{
+		if (GameplayMenuWidget)
+		{
+			GameplayMenuWidget->SetBusy(false, TEXT("只有 Standalone 主机可以开放当前世界联机"));
+		}
+		return;
+	}
+
+	USaveGameSubsystem* Saves = GetGameInstance() ? GetGameInstance()->GetSubsystem<USaveGameSubsystem>() : nullptr;
+	FString FailureReason;
+	if (!Saves || !Saves->CanSaveActiveWorld(this, FailureReason))
+	{
+		if (GameplayMenuWidget)
+		{
+			GameplayMenuWidget->SetBusy(false, Saves ? FailureReason : TEXT("存档子系统不可用"));
+		}
+		return;
+	}
+
+	bOpenMultiplayerPending = true;
+	if (GameplayMenuWidget)
+	{
+		GameplayMenuWidget->SetBusy(true, TEXT("正在保存当前世界并创建联机房间..."));
+	}
+	Saves->OnSaveFinished.AddUniqueDynamic(this, &APalPlayerController::HandleOpenMultiplayerSaveFinished);
+	if (!Saves->SaveActiveWorld(this) && bOpenMultiplayerPending)
+	{
+		Saves->OnSaveFinished.RemoveDynamic(this, &APalPlayerController::HandleOpenMultiplayerSaveFinished);
+		bOpenMultiplayerPending = false;
+		if (GameplayMenuWidget)
+		{
+			GameplayMenuWidget->SetBusy(false, TEXT("开放联机前保存失败，当前世界保持 Standalone"));
+		}
+	}
+}
+
+void APalPlayerController::HandleOpenMultiplayerSaveFinished(bool bSuccess, const FString& Message)
+{
+	if (!bOpenMultiplayerPending)
+	{
+		return;
+	}
+	USaveGameSubsystem* Saves = GetGameInstance() ? GetGameInstance()->GetSubsystem<USaveGameSubsystem>() : nullptr;
+	if (Saves)
+	{
+		Saves->OnSaveFinished.RemoveDynamic(this, &APalPlayerController::HandleOpenMultiplayerSaveFinished);
+	}
+	if (!bSuccess || !Saves || !Saves->GetActiveSave())
+	{
+		bOpenMultiplayerPending = false;
+		if (GameplayMenuWidget)
+		{
+			GameplayMenuWidget->SetBusy(false, bSuccess ? TEXT("活动世界档无效") : Message);
+		}
+		return;
+	}
+
+	UPalSessionSubsystem* Sessions = GetGameInstance()->GetSubsystem<UPalSessionSubsystem>();
+	if (!Sessions)
+	{
+		bOpenMultiplayerPending = false;
+		if (GameplayMenuWidget)
+		{
+			GameplayMenuWidget->SetBusy(false, TEXT("Session 子系统不可用"));
+		}
+		return;
+	}
+	Sessions->OnOperationFinished.RemoveDynamic(this, &APalPlayerController::HandleOpenMultiplayerSessionFinished);
+	Sessions->OnOperationFinished.AddUniqueDynamic(this, &APalPlayerController::HandleOpenMultiplayerSessionFinished);
+	Sessions->CreateRoomFromCurrentWorld(Saves->GetActiveSave()->Metadata.DisplayName, OpenWorldMaxPlayers);
+}
+
+void APalPlayerController::HandleOpenMultiplayerSessionFinished(bool bSuccess, const FString& Message)
+{
+	if (!bOpenMultiplayerPending)
+	{
+		return;
+	}
+	if (UPalSessionSubsystem* Sessions = GetGameInstance() ? GetGameInstance()->GetSubsystem<UPalSessionSubsystem>() : nullptr)
+	{
+		Sessions->OnOperationFinished.RemoveDynamic(this, &APalPlayerController::HandleOpenMultiplayerSessionFinished);
+	}
+	if (!bSuccess)
+	{
+		bOpenMultiplayerPending = false;
+	}
+	if (GameplayMenuWidget && bGameplayMenuOpen)
+	{
+		GameplayMenuWidget->SetBusy(bSuccess, Message);
+	}
+	UE_LOG(LogTemp, Warning, TEXT("[诊断] 当前世界开放联机：Success=%d Message=%s"), bSuccess, *Message);
+}
+
+void APalPlayerController::ServerRequestManualSave_Implementation()
+{
+	BeginManualSaveOnServer();
+}
+
+void APalPlayerController::BeginManualSaveOnServer()
+{
+	if (!HasAuthority())
+	{
+		DeliverManualSaveResult(false, TEXT("手动存档请求没有到达主机"));
+		return;
+	}
+
+	const double Now = FPlatformTime::Seconds();
+	if (Now - LastManualSaveRequestRealTime < 2.0)
+	{
+		DeliverManualSaveResult(false, TEXT("存档请求过于频繁，请稍后再试"));
+		return;
+	}
+	LastManualSaveRequestRealTime = Now;
+
+	USaveGameSubsystem* Saves = GetGameInstance() ? GetGameInstance()->GetSubsystem<USaveGameSubsystem>() : nullptr;
+	if (!Saves)
+	{
+		DeliverManualSaveResult(false, TEXT("存档子系统不可用"));
+		return;
+	}
+	FString FailureReason;
+	if (!Saves->CanSaveActiveWorld(this, FailureReason))
+	{
+		DeliverManualSaveResult(false, FailureReason);
+		return;
+	}
+
+	bManualSavePending = true;
+	Saves->OnSaveFinished.AddUniqueDynamic(this, &APalPlayerController::HandleManualSaveFinished);
+	if (!Saves->SaveActiveWorld(this) && bManualSavePending)
+	{
+		Saves->OnSaveFinished.RemoveDynamic(this, &APalPlayerController::HandleManualSaveFinished);
+		bManualSavePending = false;
+		DeliverManualSaveResult(false, TEXT("世界快照创建失败，上一份存档仍然安全"));
+	}
+}
+
+void APalPlayerController::HandleManualSaveFinished(bool bSuccess, const FString& Message)
+{
+	if (!bManualSavePending)
+	{
+		return;
+	}
+	if (USaveGameSubsystem* Saves = GetGameInstance() ? GetGameInstance()->GetSubsystem<USaveGameSubsystem>() : nullptr)
+	{
+		Saves->OnSaveFinished.RemoveDynamic(this, &APalPlayerController::HandleManualSaveFinished);
+	}
+	bManualSavePending = false;
+	DeliverManualSaveResult(bSuccess, bSuccess ? TEXT("手动存档完成") : Message);
+}
+
+void APalPlayerController::DeliverManualSaveResult(bool bSuccess, const FString& Message)
+{
+	bManualSavePending = false;
+	if (IsLocalController())
+	{
+		ApplyManualSaveResult(bSuccess, Message);
+	}
+	else
+	{
+		ClientManualSaveResult(bSuccess, Message);
+	}
+	UE_LOG(LogTemp, Warning, TEXT("[诊断] 手动存档结果：Success=%d Message=%s"),
+		bSuccess, *Message);
+}
+
+void APalPlayerController::ClientManualSaveResult_Implementation(bool bSuccess, const FString& Message)
+{
+	ApplyManualSaveResult(bSuccess, Message);
+}
+
+void APalPlayerController::ApplyManualSaveResult(bool bSuccess, const FString& Message)
+{
+	bManualSavePending = false;
+	if (GameplayMenuWidget && bGameplayMenuOpen)
+	{
+		GameplayMenuWidget->SetBusy(false, Message);
+	}
+}
+
+void APalPlayerController::HandleReturnToMainMenuRequested()
+{
+	if (!bGameplayMenuOpen || bManualSavePending || bOpenMultiplayerPending)
+	{
+		return;
+	}
+	if (GameplayMenuWidget)
+	{
+		GameplayMenuWidget->SetBusy(true, TEXT("正在返回主界面..."));
+	}
+	if (UPalSessionSubsystem* Sessions = GetGameInstance() ? GetGameInstance()->GetSubsystem<UPalSessionSubsystem>() : nullptr)
+	{
+		if (Sessions->LeaveToMainMenu())
+		{
+			return;
+		}
+	}
+	if (UFinalProjectGameInstance* GameInstance = Cast<UFinalProjectGameInstance>(GetGameInstance()))
+	{
+		GameInstance->ReturnToMainMenu();
+		return;
+	}
+	if (GameplayMenuWidget)
+	{
+		GameplayMenuWidget->SetBusy(false, TEXT("返回主界面失败：GameInstance 配置无效"));
 	}
 }

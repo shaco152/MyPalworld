@@ -11,7 +11,7 @@ public class FinalProject : ModuleRules
 		// 模块根目录加入 include path，使子目录类可互相 #include "子目录/头文件.h"
 		PublicIncludePaths.Add(ModuleDirectory);
 
-		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput", "GameplayAbilities", "GameplayTasks", "GameplayTags", "UMG", "AdvancedWidgets", "Slate", "SlateCore", "AIModule", "NavigationSystem" });
+		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "NetCore", "InputCore", "EnhancedInput", "GameplayAbilities", "GameplayTasks", "GameplayTags", "UMG", "AdvancedWidgets", "Slate", "SlateCore", "AIModule", "NavigationSystem", "OnlineSubsystem", "OnlineSubsystemUtils" });
 
 		PrivateDependencyModuleNames.AddRange(new string[] {  });
 

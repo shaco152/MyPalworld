@@ -6,29 +6,68 @@
 #include "Combat/PalSkillLibrary.h"
 #include "Engine/Engine.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/PlayerState.h"
+#include "Framework/FinalProjectGameInstance.h"
+#include "Net/UnrealNetwork.h"
 #include "TimerManager.h"
 
 UPalStorageComponent::UPalStorageComponent()
 {
 	PrimaryComponentTick.bCanEverTick = false; // 事件驱动，无 Tick
-	PartyPals.SetNum(PartyCapacity);
-	BoxPals.SetNum(BoxCapacity);
+	SetIsReplicatedByDefault(true);
+}
+
+void UPalStorageComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	DOREPLIFETIME_CONDITION(UPalStorageComponent, PartyPals, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UPalStorageComponent, BoxPals, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UPalStorageComponent, ActivePartyIndex, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UPalStorageComponent, SummonedPal, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UPalStorageComponent, SummonedPartyIndex, COND_OwnerOnly);
 }
 
 void UPalStorageComponent::BeginPlay()
 {
 	Super::BeginPlay();
-	EnsureSlotCounts();
+	PartyPals.Owner = this;
+	BoxPals.Owner = this;
+	if (GetOwner() && GetOwner()->HasAuthority())
+	{
+		// Fast Array 的结构只能由 Authority 建立。客户端若先创建本地占位项，
+		// 首包会把服务器条目追加到其后，下一次增量复制将得到失效索引。
+		EnsureSlotCounts();
+		PartyPals.MarkAllDirty();
+		BoxPals.MarkAllDirty();
+	}
+	else
+	{
+		// 兼容旧蓝图组件模板中已经序列化的空槽；保留首包中具有有效复制 ID 的条目。
+		const int32 RemovedParty = PartyPals.RemoveUnreplicatedLocalItems();
+		const int32 RemovedBox = BoxPals.RemoveUnreplicatedLocalItems();
+		if (RemovedParty > 0 || RemovedBox > 0)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[诊断] 客户端清理本地 FastArray 占位项：Party=%d Box=%d"),
+				RemovedParty, RemovedBox);
+		}
+	}
 
 	// 存储回血：定时器循环触发（禁止 Tick 轮询）
-	if (UWorld* World = GetWorld())
+	if (GetOwner() && GetOwner()->HasAuthority())
 	{
-		World->GetTimerManager().SetTimer(RegenTimer, this, &UPalStorageComponent::TickRegen, StoredPalRegenInterval, true);
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().SetTimer(RegenTimer, this, &UPalStorageComponent::TickRegen, StoredPalRegenInterval, true);
+		}
 	}
 }
 
 void UPalStorageComponent::EnsureSlotCounts()
 {
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		return;
+	}
 	PartyPals.SetNum(PartyCapacity);
 	BoxPals.SetNum(BoxCapacity);
 
@@ -36,10 +75,12 @@ void UPalStorageComponent::EnsureSlotCounts()
 	for (FStoredPalInfo& Info : PartyPals)
 	{
 		UPalSkillLibrary::NormalizeSkillSlots(Info.SkillRowNames);
+		PreparePersistentIdentity(Info);
 	}
 	for (FStoredPalInfo& Info : BoxPals)
 	{
 		UPalSkillLibrary::NormalizeSkillSlots(Info.SkillRowNames);
+		PreparePersistentIdentity(Info);
 	}
 }
 
@@ -63,7 +104,7 @@ void UPalStorageComponent::TickRegen()
 	if (bChanged)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[诊断] 存储回血: 背包/仓库帕鲁各回复 MaxHealth 的 %.0f%%"), StoredPalRegenPercent * 100.f);
-		OnStorageChanged.Broadcast();
+		NotifyStorageChanged();
 	}
 }
 
@@ -77,20 +118,28 @@ bool UPalStorageComponent::ApplyStoredRegen(FStoredPalInfo& Info)
 	return true;
 }
 
-bool UPalStorageComponent::TryAddToArray(TArray<FStoredPalInfo>& Array, const FStoredPalInfo& Info, const TCHAR* ArrayName)
+bool UPalStorageComponent::TryAddToArray(FReplicatedStoredPalList& Array, const FStoredPalInfo& Info, const TCHAR* ArrayName)
 {
 	for (int32 i = 0; i < Array.Num(); ++i)
 	{
 		if (!Array[i].IsValid())
 		{
+			const int32 ReplicationId = Array[i].ReplicationID;
+			const int32 ReplicationKey = Array[i].ReplicationKey;
+			const int32 MostRecentArrayKey = Array[i].MostRecentArrayReplicationKey;
 			Array[i] = Info;
+			// FFastArraySerializerItem::operator= 会主动重置复制身份；固定槽位写 payload 时必须恢复。
+			Array[i].ReplicationID = ReplicationId;
+			Array[i].ReplicationKey = ReplicationKey;
+			Array[i].MostRecentArrayReplicationKey = MostRecentArrayKey;
+			Array.MarkItemDirty(Array[i]);
 			UE_LOG(LogTemp, Warning, TEXT("[诊断] 捕捉入库: %s Lv.%.0f → %s第%d槽"), *Info.PalClass->GetName(), Info.Level, ArrayName, i);
 			if (GEngine)
 			{
 				GEngine->AddOnScreenDebugMessage(-1, 3.f, FColor::Green,
 					FString::Printf(TEXT("捕捉成功: %s Lv.%.0f → %s第%d槽"), *Info.PalClass->GetName(), Info.Level, ArrayName, i));
 			}
-			OnStorageChanged.Broadcast();
+			NotifyStorageChanged();
 			return true;
 		}
 	}
@@ -105,12 +154,14 @@ bool UPalStorageComponent::AddCapturedPal(const FStoredPalInfo& Info)
 		return false;
 	}
 
+	FStoredPalInfo StoredInfo = Info;
+	PreparePersistentIdentity(StoredInfo);
 	// 背包优先（实时投球捕捉）
-	if (TryAddToArray(PartyPals, Info, TEXT("背包")))
+	if (TryAddToArray(PartyPals, StoredInfo, TEXT("背包")))
 	{
 		return true;
 	}
-	if (TryAddToArray(BoxPals, Info, TEXT("仓库")))
+	if (TryAddToArray(BoxPals, StoredInfo, TEXT("仓库")))
 	{
 		return true;
 	}
@@ -132,12 +183,14 @@ bool UPalStorageComponent::AddCapturedPalToBox(const FStoredPalInfo& Info)
 		return false;
 	}
 
+	FStoredPalInfo StoredInfo = Info;
+	PreparePersistentIdentity(StoredInfo);
 	// 仓库优先（回合制捕捉，防现捉现用），满则背包兜底
-	if (TryAddToArray(BoxPals, Info, TEXT("仓库")))
+	if (TryAddToArray(BoxPals, StoredInfo, TEXT("仓库")))
 	{
 		return true;
 	}
-	if (TryAddToArray(PartyPals, Info, TEXT("背包")))
+	if (TryAddToArray(PartyPals, StoredInfo, TEXT("背包")))
 	{
 		return true;
 	}
@@ -153,13 +206,18 @@ bool UPalStorageComponent::AddCapturedPalToBox(const FStoredPalInfo& Info)
 
 void UPalStorageComponent::SwapSlots(bool bFromParty, int32 FromIndex, bool bToParty, int32 ToIndex)
 {
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		ServerSwapSlots(bFromParty, FromIndex, bToParty, ToIndex);
+		return;
+	}
 	UE_LOG(LogTemp, Warning, TEXT("[诊断] SwapSlots: %s第%d槽 ↔ %s第%d槽"),
 		bFromParty ? TEXT("背包") : TEXT("仓库"), FromIndex, bToParty ? TEXT("背包") : TEXT("仓库"), ToIndex);
 
 	if (bFromParty == bToParty)
 	{
 		// 同侧换位（背包↔背包 / 仓库↔仓库）
-		TArray<FStoredPalInfo>& Arr = bFromParty ? PartyPals : BoxPals;
+		FReplicatedStoredPalList& Arr = bFromParty ? PartyPals : BoxPals;
 		if (Arr.IsValidIndex(FromIndex) && Arr.IsValidIndex(ToIndex))
 		{
 			Arr.Swap(FromIndex, ToIndex);
@@ -172,11 +230,26 @@ void UPalStorageComponent::SwapSlots(bool bFromParty, int32 FromIndex, bool bToP
 	else
 	{
 		// 跨侧交换：背包槽 ↔ 仓库槽（空槽参与交换 = 移动）
-		TArray<FStoredPalInfo>& FromArr = bFromParty ? PartyPals : BoxPals;
-		TArray<FStoredPalInfo>& ToArr = bToParty ? PartyPals : BoxPals;
+		FReplicatedStoredPalList& FromArr = bFromParty ? PartyPals : BoxPals;
+		FReplicatedStoredPalList& ToArr = bToParty ? PartyPals : BoxPals;
 		if (FromArr.IsValidIndex(FromIndex) && ToArr.IsValidIndex(ToIndex))
 		{
+			const int32 FromId = FromArr[FromIndex].ReplicationID;
+			const int32 FromKey = FromArr[FromIndex].ReplicationKey;
+			const int32 FromMostRecentKey = FromArr[FromIndex].MostRecentArrayReplicationKey;
+			const int32 ToId = ToArr[ToIndex].ReplicationID;
+			const int32 ToKey = ToArr[ToIndex].ReplicationKey;
+			const int32 ToMostRecentKey = ToArr[ToIndex].MostRecentArrayReplicationKey;
 			Swap(FromArr[FromIndex], ToArr[ToIndex]);
+			// 两个数组的复制 ID 均属于固定槽位；交换 payload 后恢复槽位 ID 并仅标脏这两个槽。
+			FromArr[FromIndex].ReplicationID = FromId;
+			FromArr[FromIndex].ReplicationKey = FromKey;
+			FromArr[FromIndex].MostRecentArrayReplicationKey = FromMostRecentKey;
+			ToArr[ToIndex].ReplicationID = ToId;
+			ToArr[ToIndex].ReplicationKey = ToKey;
+			ToArr[ToIndex].MostRecentArrayReplicationKey = ToMostRecentKey;
+			FromArr.MarkItemDirty(FromArr[FromIndex]);
+			ToArr.MarkItemDirty(ToArr[ToIndex]);
 			UE_LOG(LogTemp, Warning, TEXT("[诊断] SwapSlots: 交换完成，来源槽现在=%s, 目标槽现在=%s"),
 				*GetNameSafe(FromArr[FromIndex].PalClass.Get()), *GetNameSafe(ToArr[ToIndex].PalClass.Get()));
 		}
@@ -185,11 +258,16 @@ void UPalStorageComponent::SwapSlots(bool bFromParty, int32 FromIndex, bool bToP
 			UE_LOG(LogTemp, Warning, TEXT("[诊断] SwapSlots: 索引无效（From=%d/%d, To=%d/%d），未交换"), FromIndex, FromArr.Num(), ToIndex, ToArr.Num());
 		}
 	}
-	OnStorageChanged.Broadcast();
+	NotifyStorageChanged();
 }
 
 bool UPalStorageComponent::CycleActiveIndex(int32 Delta)
 {
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		ServerCycleActiveIndex(Delta);
+		return true;
+	}
 	if (PartyPals.Num() == 0)
 	{
 		return false;
@@ -214,7 +292,7 @@ bool UPalStorageComponent::CycleActiveIndex(int32 Delta)
 			}
 			ActivePartyIndex = Candidate;
 			UE_LOG(LogTemp, Warning, TEXT("[诊断] 切换当前帕鲁 → 背包第%d槽 %s"), Candidate, *PartyPals[Candidate].PalClass->GetName());
-			OnStorageChanged.Broadcast();
+			NotifyStorageChanged();
 			return true;
 		}
 	}
@@ -225,8 +303,13 @@ bool UPalStorageComponent::CycleActiveIndex(int32 Delta)
 
 APalCharacter* UPalStorageComponent::SummonOrRecallActivePal()
 {
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		ServerSummonOrRecall();
+		return nullptr;
+	}
 	// 当前槽就是出战槽 → 收回（F 键切换式）
-	if (SummonedPal.IsValid() && SummonedPartyIndex == ActivePartyIndex)
+	if (IsValid(SummonedPal) && SummonedPartyIndex == ActivePartyIndex)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[诊断] F 键收回出战帕鲁 %s"), *SummonedPal->GetClass()->GetName());
 		if (GEngine)
@@ -239,7 +322,7 @@ APalCharacter* UPalStorageComponent::SummonOrRecallActivePal()
 	}
 
 	// 其他槽的帕鲁在出战 → 先收回再召唤当前槽
-	if (SummonedPal.IsValid())
+	if (IsValid(SummonedPal))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[诊断] 切换出战：先收回 %s"), *SummonedPal->GetClass()->GetName());
 		RecallSummonedPal();
@@ -256,7 +339,7 @@ APalCharacter* UPalStorageComponent::SummonOrRecallActivePal()
 		return nullptr;
 	}
 
-	AActor* Owner = GetOwner();
+	APawn* Owner = GetOwningPawn();
 	if (!Owner || !GetWorld())
 	{
 		return nullptr;
@@ -334,13 +417,13 @@ APalCharacter* UPalStorageComponent::SummonOrRecallActivePal()
 		GEngine->AddOnScreenDebugMessage(-1, 3.f, FColor::Cyan,
 			FString::Printf(TEXT("召唤: %s Lv.%.0f 出战（再按 F 收回）"), *Info.PalClass->GetName(), Info.Level));
 	}
-	OnStorageChanged.Broadcast();
+	NotifyStorageChanged();
 	return Pal;
 }
 
 void UPalStorageComponent::RecallSummonedPal()
 {
-	if (SummonedPal.IsValid())
+	if (IsValid(SummonedPal))
 	{
 		// 收回前把当前 HP/MP/等级/技能回写槽位快照（自由战斗掉血/回合制耗蓝要跨召唤保留）
 		if (PartyPals.IsValidIndex(SummonedPartyIndex))
@@ -367,20 +450,20 @@ void UPalStorageComponent::RecallSummonedPal()
 	}
 	SummonedPal = nullptr;
 	SummonedPartyIndex = INDEX_NONE;
-	OnStorageChanged.Broadcast();
+	NotifyStorageChanged();
 	UE_LOG(LogTemp, Warning, TEXT("[诊断] RecallSummonedPal: 出战帕鲁已收回销毁"));
 }
 
 APalCharacter* UPalStorageComponent::EnsureSummonedPal()
 {
 	// 已有存活的出战帕鲁直接用
-	if (SummonedPal.IsValid() && !SummonedPal->IsDead())
+	if (IsValid(SummonedPal) && !SummonedPal->IsDead())
 	{
 		return SummonedPal.Get();
 	}
 
 	// 残血/阵亡实体先清掉
-	if (SummonedPal.IsValid())
+	if (IsValid(SummonedPal))
 	{
 		RecallSummonedPal();
 	}
@@ -399,7 +482,7 @@ APalCharacter* UPalStorageComponent::EnsureSummonedPal()
 
 void UPalStorageComponent::HandleSummonedPalDeath(APalCharacter* Pal)
 {
-	if (SummonedPal.IsValid() && SummonedPal.Get() == Pal)
+	if (IsValid(SummonedPal) && SummonedPal.Get() == Pal)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[诊断] HandleSummonedPalDeath: 出战帕鲁阵亡，回写 HP=0 并销毁实体"));
 		// 复用收回逻辑：读属性集回写快照（此时 Health=0 → 槽位标记阵亡，不可再召唤）
@@ -414,6 +497,11 @@ void UPalStorageComponent::HandleSummonedPalDeath(APalCharacter* Pal)
 
 bool UPalStorageComponent::SetPalSkill(int32 PartyIndex, int32 SlotIndex, FName SkillRowName)
 {
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		ServerSetPalSkill(PartyIndex, SlotIndex, SkillRowName);
+		return true;
+	}
 	if (!PartyPals.IsValidIndex(PartyIndex) || !PartyPals[PartyIndex].IsValid())
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[诊断] SetPalSkill: 背包槽 %d 无效或为空"), PartyIndex);
@@ -474,14 +562,112 @@ bool UPalStorageComponent::SetPalSkill(int32 PartyIndex, int32 SlotIndex, FName 
 	Info.SkillRowNames[SlotIndex] = SkillRowName;
 
 	// 出战中的帕鲁同步到实体（回合制技能结算读实体槽位）
-	if (SummonedPal.IsValid() && SummonedPartyIndex == PartyIndex)
+	if (IsValid(SummonedPal) && SummonedPartyIndex == PartyIndex)
 	{
 		SummonedPal->SetSkillRowNames(Info.SkillRowNames);
 	}
 
 	UE_LOG(LogTemp, Warning, TEXT("[诊断] SetPalSkill: 背包槽 %d 槽位 %d ← %s"), PartyIndex, SlotIndex, *SkillRowName.ToString());
-	OnStorageChanged.Broadcast();
+	NotifyStorageChanged();
 	return true;
+}
+
+void UPalStorageComponent::RestoreSnapshot(const TArray<FStoredPalInfo>& InParty, const TArray<FStoredPalInfo>& InBox,
+	int32 InActiveIndex)
+{
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		return;
+	}
+	RecallSummonedPal();
+	PartyPals.Items = InParty;
+	BoxPals.Items = InBox;
+	ActivePartyIndex = InActiveIndex;
+	EnsureSlotCounts();
+	ActivePartyIndex = FMath::Clamp(ActivePartyIndex, 0, PartyPals.Num() - 1);
+	NotifyStorageChanged();
+}
+
+void UPalStorageComponent::HandleReplicatedStorage()
+{
+	// 客户端数组长度与复制 ID 映射均由 Fast Array 管理，禁止在 RepNotify 中 SetNum。
+	const int32 RemovedParty = PartyPals.RemoveUnreplicatedLocalItems();
+	const int32 RemovedBox = BoxPals.RemoveUnreplicatedLocalItems();
+	if (RemovedParty > 0 || RemovedBox > 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[诊断] 复制后清理本地 FastArray 占位项：Party=%d Box=%d"),
+			RemovedParty, RemovedBox);
+	}
+	OnStorageChanged.Broadcast();
+}
+
+void UPalStorageComponent::NotifyStorageChanged()
+{
+	OnStorageChanged.Broadcast();
+	if (AActor* OwnerActor = GetOwner())
+	{
+		if (OwnerActor->HasAuthority())
+		{
+			PartyPals.MarkAllDirty();
+			BoxPals.MarkAllDirty();
+		}
+		OwnerActor->ForceNetUpdate();
+	}
+}
+
+APawn* UPalStorageComponent::GetOwningPawn() const
+{
+	if (const APlayerState* PlayerState = Cast<APlayerState>(GetOwner()))
+	{
+		return PlayerState->GetPawn();
+	}
+	return Cast<APawn>(GetOwner());
+}
+
+void UPalStorageComponent::ServerSwapSlots_Implementation(bool bFromParty, int32 FromIndex, bool bToParty, int32 ToIndex)
+{
+	SwapSlots(bFromParty, FromIndex, bToParty, ToIndex);
+}
+
+void UPalStorageComponent::ServerCycleActiveIndex_Implementation(int32 Delta)
+{
+	CycleActiveIndex(Delta);
+}
+
+void UPalStorageComponent::ServerSummonOrRecall_Implementation()
+{
+	SummonOrRecallActivePal();
+}
+
+void UPalStorageComponent::ServerSetPalSkill_Implementation(int32 PartyIndex, int32 SlotIndex, FName SkillRowName)
+{
+	SetPalSkill(PartyIndex, SlotIndex, SkillRowName);
+}
+
+bool UPalStorageComponent::PreparePersistentIdentity(FStoredPalInfo& Info)
+{
+	if (!Info.IsValid())
+	{
+		return false;
+	}
+	if (!Info.PalInstanceId.IsValid() && GetOwner() && GetOwner()->HasAuthority())
+	{
+		Info.PalInstanceId = FGuid::NewGuid();
+	}
+	UFinalProjectGameInstance* GameInstance = GetWorld() ? Cast<UFinalProjectGameInstance>(GetWorld()->GetGameInstance()) : nullptr;
+	if (Info.PalDefinitionId.IsNone() && GameInstance)
+	{
+		if (!GameInstance->ResolvePalDefinitionId(Info.PalClass, Info.PalDefinitionId))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[诊断] 帕鲁类 %s 无 DefinitionId 映射；可继续运行，但保存会拒绝该条目"),
+				*GetNameSafe(Info.PalClass.Get()));
+		}
+	}
+	if (!Info.PalClass && GameInstance && !Info.PalDefinitionId.IsNone())
+	{
+		Info.PalClass = GameInstance->ResolvePalClass(Info.PalDefinitionId);
+	}
+	return Info.IsValid() && Info.PalInstanceId.IsValid() && !Info.PalDefinitionId.IsNone();
 }
 
 TArray<FName> UPalStorageComponent::GetLearnablePoolFor(const FStoredPalInfo& Info)
@@ -492,4 +678,9 @@ TArray<FName> UPalStorageComponent::GetLearnablePoolFor(const FStoredPalInfo& In
 	}
 	const APalCharacter* CDO = Info.PalClass->GetDefaultObject<APalCharacter>();
 	return CDO ? CDO->LearnableSkillRowNames : TArray<FName>();
+}
+
+void FReplicatedStoredPalList::PostReplicatedReceive(const FFastArraySerializer::FPostReplicatedReceiveParameters& Parameters)
+{
+	if (Owner) Owner->HandleReplicatedStorage();
 }

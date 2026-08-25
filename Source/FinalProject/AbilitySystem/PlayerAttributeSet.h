@@ -21,20 +21,28 @@ class FINALPROJECT_API UPlayerAttributeSet : public UAttributeSet
 
 public:
 	UPlayerAttributeSet();
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	// 血量变化广播（受伤/治疗 GE 结算后触发；UI 订阅更新——禁止 Tick 轮询）
 	UPROPERTY(BlueprintAssignable, Category = "Player|Attributes")
 	FOnPlayerHealthChanged OnHealthChanged;
 
 	// 数值配置走 APlayerCharacter 的 InitialHealth/InitialMaxHealth 普通 float（同帕鲁模式）
-	UPROPERTY(BlueprintReadOnly, Category = "Player|Attributes")
+	UPROPERTY(BlueprintReadOnly, ReplicatedUsing = OnRep_Health, Category = "Player|Attributes")
 	FGameplayAttributeData Health;
 	PLAYER_ATTRIBUTE_ACCESSORS(UPlayerAttributeSet, Health);
 
-	UPROPERTY(BlueprintReadOnly, Category = "Player|Attributes")
+	UPROPERTY(BlueprintReadOnly, ReplicatedUsing = OnRep_MaxHealth, Category = "Player|Attributes")
 	FGameplayAttributeData MaxHealth;
 	PLAYER_ATTRIBUTE_ACCESSORS(UPlayerAttributeSet, MaxHealth);
 
 	// 伤害 GE 结算后血量钳制到 [0, MaxHealth]
 	virtual void PostGameplayEffectExecute(const FGameplayEffectModCallbackData& Data) override;
+
+protected:
+	UFUNCTION()
+	void OnRep_Health(const FGameplayAttributeData& OldValue);
+
+	UFUNCTION()
+	void OnRep_MaxHealth(const FGameplayAttributeData& OldValue);
 };

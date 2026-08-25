@@ -8,6 +8,7 @@
 
 UGA_ThrowPalSphere::UGA_ThrowPalSphere()
 {
+	NetExecutionPolicy = EGameplayAbilityNetExecutionPolicy::ServerOnly;
 	// 与输入标签绑定：AbilityTags / ActivationOwnedTags 任一命中即可被 TryActivateAbilitiesByTag 激活
 	AbilityTags.AddTag(CaptureTags::TAG_InputTag_Throw.GetTag());
 	ActivationOwnedTags.AddTag(CaptureTags::TAG_InputTag_Throw.GetTag());

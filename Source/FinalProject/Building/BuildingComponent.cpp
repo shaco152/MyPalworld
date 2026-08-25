@@ -9,6 +9,8 @@
 #include "GameFramework/Controller.h"
 #include "GameFramework/Pawn.h"
 #include "Items/ItemInventoryComponent.h"
+#include "Framework/PlayerDataLibrary.h"
+#include "Framework/FinalProjectPlayerState.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
 
@@ -21,12 +23,7 @@ UBuildingComponent::UBuildingComponent()
 void UBuildingComponent::BeginPlay()
 {
 	Super::BeginPlay();
-	CachedInventory = GetOwner() ? GetOwner()->FindComponentByClass<UItemInventoryComponent>() : nullptr;
-	if (CachedInventory)
-	{
-		CachedInventory->OnInventoryChanged.RemoveDynamic(this, &UBuildingComponent::HandleInventoryChanged);
-		CachedInventory->OnInventoryChanged.AddDynamic(this, &UBuildingComponent::HandleInventoryChanged);
-	}
+	RefreshDataSource();
 
 	UE_LOG(LogTemp, Warning, TEXT("[诊断] BuildingComponent 初始化: Owner=%s Catalog=%s Inventory=%s"),
 		*GetNameSafe(GetOwner()), *GetNameSafe(BuildingCatalog), *GetNameSafe(CachedInventory));
@@ -48,7 +45,28 @@ void UBuildingComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 UItemInventoryComponent* UBuildingComponent::GetInventory() const
 {
-	return CachedInventory;
+	return UPlayerDataLibrary::ResolveItemInventory(GetOwner());
+}
+
+void UBuildingComponent::RefreshDataSource()
+{
+	UItemInventoryComponent* NewInventory = GetInventory();
+	if (CachedInventory == NewInventory)
+	{
+		return;
+	}
+	if (CachedInventory)
+	{
+		CachedInventory->OnInventoryChanged.RemoveDynamic(this, &UBuildingComponent::HandleInventoryChanged);
+	}
+	CachedInventory = NewInventory;
+	if (CachedInventory)
+	{
+		CachedInventory->OnInventoryChanged.RemoveDynamic(this, &UBuildingComponent::HandleInventoryChanged);
+		CachedInventory->OnInventoryChanged.AddDynamic(this, &UBuildingComponent::HandleInventoryChanged);
+	}
+	UE_LOG(LogTemp, Warning, TEXT("[诊断] BuildingComponent 数据源重绑: Owner=%s Inventory=%s"),
+		*GetNameSafe(GetOwner()), *GetNameSafe(CachedInventory));
 }
 
 const FBuildingRecipeRow* UBuildingComponent::FindRecipe(FName BuildingId) const
@@ -67,11 +85,12 @@ TArray<FName> UBuildingComponent::GetRecipeIds() const
 
 bool UBuildingComponent::EnterBuildMode()
 {
+	RefreshDataSource();
 	if (State != EBuildModeState::Inactive)
 	{
 		return true;
 	}
-	if (!BuildingCatalog || !CachedInventory)
+	if (!BuildingCatalog || !GetInventory())
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[诊断] EnterBuildMode 失败: Catalog=%s Inventory=%s"),
 			*GetNameSafe(BuildingCatalog), *GetNameSafe(CachedInventory));
@@ -205,7 +224,8 @@ bool UBuildingComponent::CalculatePlacementTransform(const FBuildingRecipeRow& R
 bool UBuildingComponent::ValidatePlacementTransform(const FBuildingRecipeRow& Recipe, const FTransform& Candidate,
 	AActor* ActorToIgnore, FString& OutReason) const
 {
-	if (!GetWorld() || !GetOwner() || !Recipe.BuildingClass || !CachedInventory)
+	UItemInventoryComponent* Inventory = GetInventory();
+	if (!GetWorld() || !GetOwner() || !Recipe.BuildingClass || !Inventory)
 	{
 		OutReason = TEXT("建造依赖未就绪");
 		return false;
@@ -245,7 +265,7 @@ bool UBuildingComponent::ValidatePlacementTransform(const FBuildingRecipeRow& Re
 		return false;
 	}
 
-	if (!CachedInventory->HasItems(Recipe.MaterialCosts))
+	if (!Inventory->HasItems(Recipe.MaterialCosts))
 	{
 		OutReason = TEXT("建造材料不足");
 		return false;
@@ -375,6 +395,7 @@ void UBuildingComponent::ServerPlaceBuilding_Implementation(FName BuildingId, FT
 
 bool UBuildingComponent::PlaceBuildingAuthoritative(FName BuildingId, const FTransform& RequestedTransform, FString& OutMessage)
 {
+	RefreshDataSource();
 	if (!GetOwner() || !GetOwner()->HasAuthority() || !GetWorld())
 	{
 		OutMessage = TEXT("只有服务器可以放置建筑");
@@ -382,7 +403,8 @@ bool UBuildingComponent::PlaceBuildingAuthoritative(FName BuildingId, const FTra
 	}
 
 	const FBuildingRecipeRow* Recipe = FindRecipe(BuildingId);
-	if (!Recipe || !Recipe->BuildingClass || !CachedInventory)
+	UItemInventoryComponent* Inventory = GetInventory();
+	if (!Recipe || !Recipe->BuildingClass || !Inventory)
 	{
 		OutMessage = TEXT("建筑配方无效");
 		return false;
@@ -403,11 +425,19 @@ bool UBuildingComponent::PlaceBuildingAuthoritative(FName BuildingId, const FTra
 		OutMessage = TEXT("建筑生成失败");
 		return false;
 	}
-	Building->InitializePlacedBuilding(BuildingId);
+	FGuid OwnerPlayerId;
+	if (const APawn* OwnerPawn = Cast<APawn>(GetOwner()))
+	{
+		if (const AFinalProjectPlayerState* PlayerState = OwnerPawn->GetPlayerState<AFinalProjectPlayerState>())
+		{
+			OwnerPlayerId = PlayerState->GetPlayerPersistentId();
+		}
+	}
+	Building->InitializePersistentBuilding(BuildingId, FGuid::NewGuid(), OwnerPlayerId);
 	Building->SetPlacementPreview(false, true);
 	Building->FinishSpawning(RequestedTransform);
 
-	if (!CachedInventory->ConsumeItems(Recipe->MaterialCosts))
+	if (!Inventory->ConsumeItems(Recipe->MaterialCosts))
 	{
 		Building->Destroy();
 		OutMessage = TEXT("材料在放置前发生变化");

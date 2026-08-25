@@ -15,6 +15,11 @@ bool UCombatLibrary::ApplyDamage(AActor* Source, AActor* Target, float Amount)
 	{
 		return false;
 	}
+	if (!Target->HasAuthority())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[诊断] ApplyDamage 拒绝客户端结算：Target=%s"), *GetNameSafe(Target));
+		return false;
+	}
 
 	const IAbilitySystemInterface* ASI = Cast<IAbilitySystemInterface>(Target);
 	if (!ASI || !ASI->GetAbilitySystemComponent())

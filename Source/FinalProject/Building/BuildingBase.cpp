@@ -5,6 +5,7 @@
 #include "Components/SceneComponent.h"
 #include "Materials/MaterialInterface.h"
 #include "Net/UnrealNetwork.h"
+#include "Persistence/WorldPersistenceSubsystem.h"
 
 ABuildingBase::ABuildingBase()
 {
@@ -30,9 +31,28 @@ void ABuildingBase::BeginPlay()
 	{
 		PersistentId = FGuid::NewGuid();
 	}
+	if (!bPlacementPreview && HasAuthority())
+	{
+		if (UWorldPersistenceSubsystem* Persistence = GetWorld()->GetSubsystem<UWorldPersistenceSubsystem>())
+		{
+			Persistence->RegisterBuilding(this);
+		}
+	}
 
 	UE_LOG(LogTemp, Warning, TEXT("[诊断] BuildingBase BeginPlay: %s TypeId=%s PersistentId=%s Preview=%d"),
 		*GetName(), *BuildingTypeId.ToString(), *PersistentId.ToString(), bPlacementPreview);
+}
+
+void ABuildingBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	if (HasAuthority() && GetWorld())
+	{
+		if (UWorldPersistenceSubsystem* Persistence = GetWorld()->GetSubsystem<UWorldPersistenceSubsystem>())
+		{
+			Persistence->UnregisterBuilding(this);
+		}
+	}
+	Super::EndPlay(EndPlayReason);
 }
 
 void ABuildingBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -40,6 +60,15 @@ void ABuildingBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLif
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	DOREPLIFETIME(ABuildingBase, PersistentId);
 	DOREPLIFETIME(ABuildingBase, BuildingTypeId);
+	DOREPLIFETIME(ABuildingBase, OwnerPlayerId);
+}
+
+void ABuildingBase::InitializePersistentBuilding(FName InBuildingTypeId, const FGuid& InPersistentId,
+	const FGuid& InOwnerPlayerId)
+{
+	BuildingTypeId = InBuildingTypeId;
+	PersistentId = InPersistentId;
+	OwnerPlayerId = InOwnerPlayerId;
 }
 
 void ABuildingBase::InitializePlacedBuilding(FName InBuildingTypeId)

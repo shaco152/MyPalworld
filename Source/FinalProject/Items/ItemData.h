@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DataTable.h"
+#include "Net/Serialization/FastArraySerializer.h"
 #include "ItemData.generated.h"
 
 class UTexture2D;
@@ -37,7 +38,7 @@ struct FINALPROJECT_API FItemDefinitionRow : public FTableRowBase
 
 /** 背包中的一个堆叠。空堆叠 = ItemId 为空或 Quantity <= 0。 */
 USTRUCT(BlueprintType)
-struct FINALPROJECT_API FItemStack
+struct FINALPROJECT_API FItemStack : public FFastArraySerializerItem
 {
 	GENERATED_BODY()
 

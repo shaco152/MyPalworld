@@ -6,6 +6,7 @@
 #include "AbilitySystemInterface.h"
 #include "Characters/PlayerCharacter.h"
 #include "Combat/TurnBattleComponent.h"
+#include "Building/BuildingComponent.h"
 #include "Components/InputComponent.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
@@ -15,6 +16,9 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/Pawn.h"
 #include "Storage/PalStorageComponent.h"
+#include "Items/ItemInventoryComponent.h"
+#include "UI/BuildMenuWidget.h"
+#include "UI/MaterialInventoryWidget.h"
 #include "UI/PalBoxWidget.h"
 #include "UI/PalHUDWidget.h"
 
@@ -41,6 +45,7 @@ void APalPlayerController::BeginPlay()
 
 	// 懒建背包 HUD（此时 Pawn 可能尚未生成，OnPossess 会兜底再试一次）
 	CreateHUDIfNeeded();
+	BindBuildingComponent();
 }
 
 void APalPlayerController::OnPossess(APawn* InPawn)
@@ -48,6 +53,7 @@ void APalPlayerController::OnPossess(APawn* InPawn)
 	Super::OnPossess(InPawn);
 	UE_LOG(LogTemp, Warning, TEXT("[诊断] APalPlayerController::OnPossess: Pawn=%s"), *GetNameSafe(InPawn));
 	CreateHUDIfNeeded();
+	BindBuildingComponent();
 }
 
 void APalPlayerController::SetupInputComponent()
@@ -178,6 +184,33 @@ void APalPlayerController::SetupInputComponent()
 	{
 		GEngine->AddOnScreenDebugMessage(-1, 10.f, FColor::Red, TEXT("[诊断] BP_PC 未设置 UIBackAction！请创建 IA_UIBack 并映射 Esc"));
 	}
+
+	if (MaterialInventoryAction)
+	{
+		EIC->BindAction(MaterialInventoryAction, ETriggerEvent::Started, this, &APalPlayerController::OnToggleMaterialInventory);
+	}
+	else if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 10.f, FColor::Red, TEXT("[诊断] BP_PC 未设置 MaterialInventoryAction（B 键）"));
+	}
+
+	if (BuildModeAction)
+	{
+		EIC->BindAction(BuildModeAction, ETriggerEvent::Started, this, &APalPlayerController::OnToggleBuildMode);
+	}
+	else if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 10.f, FColor::Red, TEXT("[诊断] BP_PC 未设置 BuildModeAction（C 键）"));
+	}
+
+	if (BuildRotateAction)
+	{
+		EIC->BindAction(BuildRotateAction, ETriggerEvent::Triggered, this, &APalPlayerController::OnBuildRotate);
+	}
+	else if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 10.f, FColor::Red, TEXT("[诊断] BP_PC 未设置 BuildRotateAction（鼠标滚轮 Axis1D）"));
+	}
 }
 
 void APalPlayerController::OnThrowPressed()
@@ -192,6 +225,11 @@ void APalPlayerController::OnThrowPressed()
 
 void APalPlayerController::OnAttackPressed()
 {
+	if (UBuildingComponent* Building = GetBuildingComponent(); Building && Building->HasActivePreview())
+	{
+		Building->ConfirmPlacement(); // 建造预览中复用左键确认，不触发普攻
+		return;
+	}
 	if (IsGameplayInputBlocked())
 	{
 		return; // 仓库打开/回合制战斗中冻结角色操作
@@ -202,9 +240,9 @@ void APalPlayerController::OnAttackPressed()
 
 void APalPlayerController::OnTurnBattlePressed()
 {
-	if (bBoxOpen)
+	if (IsGameplayInputBlocked())
 	{
-		return; // 仓库打开时忽略
+		return; // 任一 UI / 建造模式打开时忽略
 	}
 
 	if (const APlayerCharacter* PlayerPawn = Cast<APlayerCharacter>(GetPawn()))
@@ -251,13 +289,33 @@ void APalPlayerController::OnBattleCameraRotate(const FInputActionValue& Value)
 
 bool APalPlayerController::IsGameplayInputBlocked() const
 {
-	if (bBoxOpen)
+	if (IsMovementInputBlocked())
+	{
+		return true;
+	}
+	if (const UBuildingComponent* Building = GetBuildingComponent())
+	{
+		return Building->IsBuildModeActive();
+	}
+	return false;
+}
+
+bool APalPlayerController::IsMovementInputBlocked() const
+{
+	if (bBoxOpen || bMaterialInventoryOpen)
 	{
 		return true;
 	}
 	if (const APlayerCharacter* PlayerPawn = Cast<APlayerCharacter>(GetPawn()))
 	{
-		return PlayerPawn->IsInTurnBattle();
+		if (PlayerPawn->IsInTurnBattle())
+		{
+			return true;
+		}
+	}
+	if (const UBuildingComponent* Building = GetBuildingComponent())
+	{
+		return Building->GetBuildModeState() == EBuildModeState::CatalogOpen;
 	}
 	return false;
 }
@@ -313,7 +371,7 @@ void APalPlayerController::ActivateAbilityByTag(const FGameplayTag& InputTag, co
 
 void APalPlayerController::OnMove(const FInputActionValue& Value)
 {
-	if (IsGameplayInputBlocked())
+	if (IsMovementInputBlocked())
 	{
 		return; // 仓库打开/回合制战斗中冻结角色操作
 	}
@@ -336,7 +394,7 @@ void APalPlayerController::OnMove(const FInputActionValue& Value)
 
 void APalPlayerController::OnLook(const FInputActionValue& Value)
 {
-	if (IsGameplayInputBlocked())
+	if (IsMovementInputBlocked())
 	{
 		return; // 仓库打开/回合制战斗中冻结角色操作
 	}
@@ -349,7 +407,7 @@ void APalPlayerController::OnLook(const FInputActionValue& Value)
 
 void APalPlayerController::OnJumpPressed()
 {
-	if (bBoxOpen)
+	if (IsMovementInputBlocked())
 	{
 		return;
 	}
@@ -362,7 +420,7 @@ void APalPlayerController::OnJumpPressed()
 
 void APalPlayerController::OnJumpReleased()
 {
-	if (bBoxOpen)
+	if (IsMovementInputBlocked())
 	{
 		return;
 	}
@@ -375,7 +433,7 @@ void APalPlayerController::OnJumpReleased()
 
 void APalPlayerController::OnSprintPressed()
 {
-	if (bBoxOpen)
+	if (IsMovementInputBlocked())
 	{
 		return;
 	}
@@ -391,7 +449,7 @@ void APalPlayerController::OnSprintPressed()
 
 void APalPlayerController::OnSprintReleased()
 {
-	if (bBoxOpen)
+	if (IsMovementInputBlocked())
 	{
 		return;
 	}
@@ -409,6 +467,27 @@ UPalStorageComponent* APalPlayerController::GetPalStorage() const
 {
 	const APawn* ControlledPawn = GetPawn();
 	return ControlledPawn ? ControlledPawn->FindComponentByClass<UPalStorageComponent>() : nullptr;
+}
+
+UItemInventoryComponent* APalPlayerController::GetItemInventory() const
+{
+	const APawn* ControlledPawn = GetPawn();
+	return ControlledPawn ? ControlledPawn->FindComponentByClass<UItemInventoryComponent>() : nullptr;
+}
+
+UBuildingComponent* APalPlayerController::GetBuildingComponent() const
+{
+	const APawn* ControlledPawn = GetPawn();
+	return ControlledPawn ? ControlledPawn->FindComponentByClass<UBuildingComponent>() : nullptr;
+}
+
+void APalPlayerController::BindBuildingComponent()
+{
+	if (UBuildingComponent* Building = GetBuildingComponent())
+	{
+		Building->OnBuildModeStateChanged.RemoveDynamic(this, &APalPlayerController::OnBuildModeStateChanged);
+		Building->OnBuildModeStateChanged.AddDynamic(this, &APalPlayerController::OnBuildModeStateChanged);
+	}
 }
 
 void APalPlayerController::CreateHUDIfNeeded()
@@ -453,6 +532,14 @@ void APalPlayerController::SetPersistentHUDVisible(bool bVisible)
 
 void APalPlayerController::OnToggleBox()
 {
+	if (!bBoxOpen)
+	{
+		const UBuildingComponent* Building = GetBuildingComponent();
+		if (bMaterialInventoryOpen || (Building && Building->IsBuildModeActive()))
+		{
+			return;
+		}
+	}
 	// 回合制战斗中不能开仓库（关仓库的 E 不受影响）
 	if (const APlayerCharacter* PlayerPawn = Cast<APlayerCharacter>(GetPawn()))
 	{
@@ -611,12 +698,157 @@ void APalPlayerController::OnPartyNext()
 
 void APalPlayerController::OnUIBackPressed()
 {
-	// Esc 只取消回合制切换子页面；仓库继续使用 E，主战斗页 Esc 不结束战斗。
+	// Esc 优先取消建造/材料背包；仓库继续使用 E；主战斗页 Esc 不结束战斗。
+	if (UBuildingComponent* Building = GetBuildingComponent(); Building && Building->IsBuildModeActive())
+	{
+		Building->ExitBuildMode();
+		return;
+	}
+	if (bMaterialInventoryOpen)
+	{
+		OnToggleMaterialInventory();
+		return;
+	}
 	if (const APlayerCharacter* PlayerPawn = Cast<APlayerCharacter>(GetPawn()))
 	{
 		if (UTurnBattleComponent* Battle = PlayerPawn->GetTurnBattleComponent(); Battle && Battle->IsSwitchPanelVisible())
 		{
 			Battle->CancelSwitchSelection();
 		}
+	}
+}
+
+void APalPlayerController::OnToggleMaterialInventory()
+{
+	if (!bMaterialInventoryOpen)
+	{
+		const APlayerCharacter* PlayerPawn = Cast<APlayerCharacter>(GetPawn());
+		const UBuildingComponent* Building = GetBuildingComponent();
+		if (bBoxOpen || (PlayerPawn && PlayerPawn->IsInTurnBattle()) || (Building && Building->IsBuildModeActive()))
+		{
+			return;
+		}
+		UItemInventoryComponent* Inventory = GetItemInventory();
+		if (!Inventory || !MaterialInventoryWidgetClass)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[诊断] 打开材料背包失败: Inventory=%s WidgetClass=%s"),
+				*GetNameSafe(Inventory), *GetNameSafe(MaterialInventoryWidgetClass));
+			return;
+		}
+
+		if (!MaterialInventoryWidget)
+		{
+			MaterialInventoryWidget = CreateWidget<UMaterialInventoryWidget>(this, MaterialInventoryWidgetClass);
+		}
+		if (!MaterialInventoryWidget)
+		{
+			return;
+		}
+		MaterialInventoryWidget->InitFromInventory(Inventory);
+		MaterialInventoryWidget->AddToViewport(10);
+		bMaterialInventoryOpen = true;
+		SetPersistentHUDVisible(false);
+
+		FInputModeGameAndUI Mode;
+		Mode.SetWidgetToFocus(MaterialInventoryWidget->TakeWidget());
+		Mode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+		Mode.SetHideCursorDuringCapture(false);
+		SetInputMode(Mode);
+		SetShowMouseCursor(true);
+		UE_LOG(LogTemp, Warning, TEXT("[诊断] 材料背包已打开（B/Esc 关闭）"));
+	}
+	else
+	{
+		if (MaterialInventoryWidget)
+		{
+			MaterialInventoryWidget->RemoveFromParent();
+		}
+		bMaterialInventoryOpen = false;
+		SetInputMode(FInputModeGameOnly());
+		SetShowMouseCursor(false);
+		SetPersistentHUDVisible(true);
+		UE_LOG(LogTemp, Warning, TEXT("[诊断] 材料背包已关闭"));
+	}
+}
+
+void APalPlayerController::OnToggleBuildMode()
+{
+	UBuildingComponent* Building = GetBuildingComponent();
+	if (!Building)
+	{
+		return;
+	}
+	if (Building->IsBuildModeActive())
+	{
+		Building->ExitBuildMode();
+		return;
+	}
+
+	const APlayerCharacter* PlayerPawn = Cast<APlayerCharacter>(GetPawn());
+	if (bBoxOpen || bMaterialInventoryOpen || (PlayerPawn && PlayerPawn->IsInTurnBattle()))
+	{
+		return;
+	}
+	Building->EnterBuildMode();
+}
+
+void APalPlayerController::OnBuildRotate(const FInputActionValue& Value)
+{
+	if (UBuildingComponent* Building = GetBuildingComponent())
+	{
+		Building->RotatePreview(Value.Get<float>());
+	}
+}
+
+void APalPlayerController::OnBuildModeStateChanged(EBuildModeState NewState)
+{
+	if (NewState == EBuildModeState::CatalogOpen)
+	{
+		UBuildingComponent* Building = GetBuildingComponent();
+		if (!Building || !BuildMenuWidgetClass)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[诊断] 建造目录 UI 未配置: Component=%s WidgetClass=%s"),
+				*GetNameSafe(Building), *GetNameSafe(BuildMenuWidgetClass));
+			if (Building)
+			{
+				Building->ExitBuildMode();
+			}
+			return;
+		}
+		if (!BuildMenuWidget)
+		{
+			BuildMenuWidget = CreateWidget<UBuildMenuWidget>(this, BuildMenuWidgetClass);
+		}
+		if (!BuildMenuWidget)
+		{
+			Building->ExitBuildMode();
+			return;
+		}
+		BuildMenuWidget->InitFromBuildingComponent(Building);
+		BuildMenuWidget->AddToViewport(10);
+		SetPersistentHUDVisible(false);
+
+		FInputModeGameAndUI Mode;
+		Mode.SetWidgetToFocus(BuildMenuWidget->TakeWidget());
+		Mode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+		Mode.SetHideCursorDuringCapture(false);
+		SetInputMode(Mode);
+		SetShowMouseCursor(true);
+		return;
+	}
+
+	if (BuildMenuWidget)
+	{
+		BuildMenuWidget->RemoveFromParent();
+	}
+	SetInputMode(FInputModeGameOnly());
+	SetShowMouseCursor(false);
+	if (NewState == EBuildModeState::Inactive)
+	{
+		SetPersistentHUDVisible(true);
+	}
+	else
+	{
+		SetPersistentHUDVisible(false); // Previewing：保留干净的建造视野
 	}
 }

@@ -5,6 +5,7 @@
 #include "AbilitySystem/PlayerAttributeSet.h"
 #include "AbilitySystemComponent.h"
 #include "Combat/TurnBattleComponent.h"
+#include "Building/BuildingComponent.h"
 #include "Engine/Engine.h"
 #include "Camera/CameraComponent.h"
 #include "GameFramework/PlayerStart.h"
@@ -12,12 +13,15 @@
 #include "EngineUtils.h"
 #include "TimerManager.h"
 #include "Storage/PalStorageComponent.h"
+#include "Items/ItemInventoryComponent.h"
 
 APlayerCharacter::APlayerCharacter()
 {
 	AbilitySystem = CreateDefaultSubobject<UAbilitySystemComponent>(TEXT("AbilitySystem"));
 	PlayerAttributeSet = CreateDefaultSubobject<UPlayerAttributeSet>(TEXT("PlayerAttributeSet"));
 	StorageComponent = CreateDefaultSubobject<UPalStorageComponent>(TEXT("PalStorage"));
+	ItemInventory = CreateDefaultSubobject<UItemInventoryComponent>(TEXT("ItemInventory"));
+	BuildingComponent = CreateDefaultSubobject<UBuildingComponent>(TEXT("BuildingComponent"));
 	TurnBattle = CreateDefaultSubobject<UTurnBattleComponent>(TEXT("TurnBattle"));
 	ThrowAbilityClass = UGA_ThrowPalSphere::StaticClass();
 	AttackAbilityClass = UGA_PlayerAttack::StaticClass();

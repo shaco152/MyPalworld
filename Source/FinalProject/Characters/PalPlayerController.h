@@ -4,6 +4,7 @@
 #include "GameFramework/PlayerController.h"
 #include "GameplayTagContainer.h"
 #include "InputActionValue.h"
+#include "Building/BuildingComponent.h"
 #include "PalPlayerController.generated.h"
 
 class UInputAction;
@@ -12,6 +13,9 @@ class UPalHUDWidget;
 class UPalBoxWidget;
 class UPalStorageComponent;
 class UGameplayAbility;
+class UItemInventoryComponent;
+class UMaterialInventoryWidget;
+class UBuildMenuWidget;
 
 /**
  * 玩家控制器：负责 EnhancedInput 的绑定（官方 GAS 输入推荐挂点）。
@@ -101,6 +105,22 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "PalUI")
 	TObjectPtr<UInputAction> UIBackAction;
 
+	// 材料背包/建造输入：B 开材料背包、C 切建造模式、滚轮旋转虚影
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "BuildUI|Input")
+	TObjectPtr<UInputAction> MaterialInventoryAction;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "BuildUI|Input")
+	TObjectPtr<UInputAction> BuildModeAction;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "BuildUI|Input")
+	TObjectPtr<UInputAction> BuildRotateAction;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "BuildUI")
+	TSubclassOf<UMaterialInventoryWidget> MaterialInventoryWidgetClass;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "BuildUI")
+	TSubclassOf<UBuildMenuWidget> BuildMenuWidgetClass;
+
 private:
 	// 按输入标签激活当前 Pawn 的能力（投掷/攻击共用）；失败按类兜底
 	void ActivateAbilityByTag(const FGameplayTag& InputTag, const TSubclassOf<UGameplayAbility>& FallbackClass);
@@ -124,15 +144,25 @@ private:
 	void OnPartyPrev();
 	void OnPartyNext();
 	void OnUIBackPressed();
+	void OnToggleMaterialInventory();
+	void OnToggleBuildMode();
+	void OnBuildRotate(const FInputActionValue& Value);
+
+	UFUNCTION()
+	void OnBuildModeStateChanged(EBuildModeState NewState);
 
 	// 懒建 HUD（BeginPlay 与 OnPossess 都调用，幂等；WorldPartition 地图下二者先后不定）
 	void CreateHUDIfNeeded();
 
 	// 取当前 Pawn 上的存储组件（可能为空）
 	UPalStorageComponent* GetPalStorage() const;
+	UItemInventoryComponent* GetItemInventory() const;
+	UBuildingComponent* GetBuildingComponent() const;
+	void BindBuildingComponent();
 
 	// 玩法输入是否应冻结（仓库打开 / 回合制战斗中）
 	bool IsGameplayInputBlocked() const;
+	bool IsMovementInputBlocked() const;
 
 	UPROPERTY()
 	TObjectPtr<UPalHUDWidget> HUDWidget;
@@ -140,7 +170,14 @@ private:
 	UPROPERTY()
 	TObjectPtr<UPalBoxWidget> BoxWidget;
 
+	UPROPERTY()
+	TObjectPtr<UMaterialInventoryWidget> MaterialInventoryWidget;
+
+	UPROPERTY()
+	TObjectPtr<UBuildMenuWidget> BuildMenuWidget;
+
 	bool bBoxOpen = false;
+	bool bMaterialInventoryOpen = false;
 
 	// 观战相机旋转是否按住右键中
 	bool bBattleCameraHeld = false;

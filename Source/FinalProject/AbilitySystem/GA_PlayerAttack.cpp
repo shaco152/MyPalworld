@@ -6,9 +6,11 @@
 #include "GameFramework/Character.h"
 #include "GameFramework/Controller.h"
 #include "GameFramework/Pawn.h"
+#include "Items/HitReactInterface.h"
 
 UGA_PlayerAttack::UGA_PlayerAttack()
 {
+	InstancingPolicy = EGameplayAbilityInstancingPolicy::InstancedPerActor;
 	// 与输入标签绑定（同投掷能力模式）
 	AbilityTags.AddTag(CaptureTags::TAG_InputTag_Attack.GetTag());
 	ActivationOwnedTags.AddTag(CaptureTags::TAG_InputTag_Attack.GetTag());
@@ -65,8 +67,29 @@ void UGA_PlayerAttack::ActivateAbility(const FGameplayAbilitySpecHandle Handle, 
 
 	if (bHit && Hit.GetActor())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[诊断] 玩家攻击命中 %s，伤害 %.0f"), *Hit.GetActor()->GetName(), AttackPower);
-		UCombatLibrary::ApplyDamage(Avatar, Hit.GetActor(), AttackPower);
+		AActor* HitActor = Hit.GetActor();
+		if (HitActor->Implements<UHitReactInterface>())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[诊断] 玩家攻击触发 HitReact: %s"), *HitActor->GetName());
+			IHitReactInterface::Execute_ReceiveHitReact(HitActor, Avatar, Hit);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[诊断] 玩家攻击命中 %s，伤害 %.0f"), *HitActor->GetName(), AttackPower);
+			UCombatLibrary::ApplyDamage(Avatar, HitActor, AttackPower);
+		}
+	}
+	else
+	{
+		// 资源点通常是 WorldStatic/WorldDynamic，不会进入 ECC_Pawn 扫描；以 Visibility 做第二条窄扫描。
+		FHitResult ReactHit;
+		const bool bHitReactActor = GetWorld()->SweepSingleByChannel(ReactHit, Start, Start + Dir * AttackRange,
+			FQuat::Identity, ECC_Visibility, FCollisionShape::MakeSphere(AttackRadius), Params);
+		if (bHitReactActor && ReactHit.GetActor() && ReactHit.GetActor()->Implements<UHitReactInterface>())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[诊断] 玩家攻击触发资源 HitReact: %s"), *ReactHit.GetActor()->GetName());
+			IHitReactInterface::Execute_ReceiveHitReact(ReactHit.GetActor(), Avatar, ReactHit);
+		}
 	}
 
 	EndAbility(Handle, ActorInfo, ActivationInfo, true, false);

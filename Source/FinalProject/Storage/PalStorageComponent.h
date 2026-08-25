@@ -225,6 +225,7 @@ public:
 
 protected:
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 	UFUNCTION(Server, Reliable)
 	void ServerSwapSlots(bool bFromParty, int32 FromIndex, bool bToParty, int32 ToIndex);
@@ -251,9 +252,14 @@ private:
 	// 回血定时器
 	FTimerHandle RegenTimer;
 
+	// FastArray 负责传输槽位 payload；此版本号提供独立的 OwnerOnly RepNotify，
+	// 确保只有数值变化（如仓库回血）时，客户端已打开的 UMG 也一定收到刷新信号。
+	UPROPERTY(ReplicatedUsing = HandleReplicatedStorage)
+	uint32 StorageRevision = 0;
+
 	// 按容量保证数组槽数（BP 里改 BoxCapacity 后构造期拿不到，BeginPlay 校正）
 	void EnsureSlotCounts();
-	void NotifyStorageChanged();
+	void NotifyStorageChanged(bool bMarkAllItemsDirty = true);
 	APawn* GetOwningPawn() const;
 	bool PreparePersistentIdentity(FStoredPalInfo& Info);
 

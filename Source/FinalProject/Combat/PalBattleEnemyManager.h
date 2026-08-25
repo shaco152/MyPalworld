@@ -23,6 +23,7 @@ public:
 	APalCharacter* GetActiveEnemy() const;
 	int32 GetRemainingEnemyCount() const;
 	bool HasRemainingEnemy() const { return GetRemainingEnemyCount() > 0; }
+	bool HasRoster() const { return !Roster.IsEmpty(); }
 
 	// 当前敌人真正退场，随后将下一只激活在同一战斗位置。
 	APalCharacter* AdvanceRoster(bool bCaptured);

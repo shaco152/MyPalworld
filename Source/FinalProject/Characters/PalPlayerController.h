@@ -39,6 +39,7 @@ public:
 
 	// 回合制战斗期间隐藏常驻背包/玩家血量 HUD，战斗结束恢复。
 	void SetPersistentHUDVisible(bool bVisible);
+	void ResetBattleCameraInputState();
 
 protected:
 	// 输入资产在 BP_PalPlayerController 里设置（C++ 无法创建资产）
@@ -226,4 +227,5 @@ private:
 
 	// 观战相机旋转是否按住右键中
 	bool bBattleCameraHeld = false;
+	bool bBattleCameraMovedThisDrag = false;
 };

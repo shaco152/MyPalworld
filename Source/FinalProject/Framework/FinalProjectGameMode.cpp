@@ -3,12 +3,15 @@
 #include "Engine/World.h"
 #include "Framework/FinalProjectGameState.h"
 #include "Framework/FinalProjectPlayerState.h"
+#include "Characters/PlayerCharacter.h"
+#include "Combat/TurnBattleComponent.h"
 #include "Engine/GameInstance.h"
 #include "GameFramework/GameStateBase.h"
 #include "Kismet/GameplayStatics.h"
 #include "Persistence/SaveGameSubsystem.h"
 #include "Persistence/WorldPersistenceSubsystem.h"
 #include "Online/PalSessionSubsystem.h"
+#include "Storage/PalStorageComponent.h"
 #include "TimerManager.h"
 
 AFinalProjectGameMode::AFinalProjectGameMode()
@@ -166,6 +169,32 @@ void AFinalProjectGameMode::FinishRestartPlayer(AController* NewPlayer, const FR
 	{
 		Saves->SaveActiveWorld(this);
 	}
+}
+
+void AFinalProjectGameMode::Logout(AController* Exiting)
+{
+	AFinalProjectPlayerState* ProjectPlayerState = Exiting
+		? Exiting->GetPlayerState<AFinalProjectPlayerState>() : nullptr;
+	const FGuid PlayerId = ProjectPlayerState ? ProjectPlayerState->GetPlayerPersistentId() : FGuid();
+	APlayerCharacter* PlayerPawn = Exiting ? Cast<APlayerCharacter>(Exiting->GetPawn()) : nullptr;
+	if (PlayerPawn)
+	{
+		if (UTurnBattleComponent* Battle = PlayerPawn->GetTurnBattleComponent())
+		{
+			Battle->AbortBattleForDisconnect();
+		}
+	}
+	// PlayerState 是召唤数据权威宿主；必须在 Super::Logout 销毁 PlayerState/Pawn 之前回写并销毁实体。
+	if (UPalStorageComponent* Storage = ProjectPlayerState ? ProjectPlayerState->GetPalStorage() : nullptr;
+		Storage && Storage->HasSummonedPal())
+	{
+		Storage->RecallSummonedPal();
+	}
+	RestoredPlayerStates.Remove(ProjectPlayerState);
+	RestoredPawns.Remove(Exiting);
+	UE_LOG(LogTemp, Warning, TEXT("[诊断] 玩家离线权威清理完成：Controller=%s ProfileId=%s"),
+		*GetNameSafe(Exiting), *PlayerId.ToString(EGuidFormats::Digits));
+	Super::Logout(Exiting);
 }
 
 void AFinalProjectGameMode::AutoSave()

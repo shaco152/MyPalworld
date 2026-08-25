@@ -35,6 +35,7 @@ protected:
 		const FString& Options, const FString& Portal = TEXT("")) override;
 	virtual void HandleStartingNewPlayer_Implementation(APlayerController* NewPlayer) override;
 	virtual void FinishRestartPlayer(AController* NewPlayer, const FRotator& StartRotation) override;
+	virtual void Logout(AController* Exiting) override;
 
 private:
 	void AutoSave();

@@ -35,6 +35,7 @@ class FINALPROJECT_API UTurnBattleComponent : public UActorComponent
 public:
 	UTurnBattleComponent();
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 	// 尝试开始战斗（P 键）：搜附近敌意野帕鲁 → 卷入 → 冻结角色 → 出战斗 UI
 	void TryStartBattle();
@@ -65,6 +66,9 @@ public:
 
 	// 战斗中右键拖动旋转观战相机（输入由 APalPlayerController 的 IA 转发到这里）
 	void RotateBattleCamera(const FVector2D& Delta);
+
+	/** 服务端玩家离线/Pawn 异常销毁时调用：恢复敌方世界状态并终止全部回合回调。 */
+	void AbortBattleForDisconnect();
 
 	// 通用药数值（回上限的 10%，3 回合冷却）
 	static constexpr float MedRestorePercent = 0.1f;
@@ -141,7 +145,7 @@ private:
 	void ServerTryUseMed(bool bHP);
 
 	UFUNCTION(Client, Reliable)
-	void ClientOpenBattleUI(APalCharacter* InOurPal, APalCharacter* InEnemy, class ACameraActor* InCamera);
+	void ClientOpenBattleUI(APalCharacter* InOurPal, APalCharacter* InEnemy, FTransform InitialCameraTransform);
 	UFUNCTION(Client, Reliable)
 	void ClientCloseBattleUI();
 	UFUNCTION()
@@ -153,6 +157,7 @@ private:
 	void ResolveVictory();
 	void ResolveDefeat();
 	void EndBattle();
+	void CleanupBattle(bool bRestoreEnemies, bool bNotifyOwningClient, const TCHAR* Reason);
 
 	// 我方出战帕鲁阵亡：收回 → 自动换下一个存活帕鲁；全灭 → 战败
 	void HandleOurPalDefeated();
@@ -201,9 +206,11 @@ private:
 	FTimerHandle EnemyTurnTimer;
 	FTimerHandle EndTimer;
 
-	// 观战相机（独立于玩家的战斗镜头；结束 Blend 回玩家后销毁）
-	UPROPERTY(Replicated)
-	TObjectPtr<class ACameraActor> BattleCamera;
+	// 纯本地观战相机。服务器只通过 Client RPC 发送初始 Transform，禁止复制 Actor 指针。
+	UPROPERTY(Transient)
+	TObjectPtr<class ACameraActor> LocalBattleCamera;
+
+	bool bBattleCleanupInProgress = false;
 
 	// 进入战斗前的玩家位置（结束转回）
 	FVector OriginalPlayerLocation = FVector::ZeroVector;

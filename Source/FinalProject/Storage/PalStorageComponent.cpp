@@ -25,6 +25,7 @@ void UPalStorageComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>&
 	DOREPLIFETIME_CONDITION(UPalStorageComponent, ActivePartyIndex, COND_OwnerOnly);
 	DOREPLIFETIME_CONDITION(UPalStorageComponent, SummonedPal, COND_OwnerOnly);
 	DOREPLIFETIME_CONDITION(UPalStorageComponent, SummonedPartyIndex, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UPalStorageComponent, StorageRevision, COND_OwnerOnly);
 }
 
 void UPalStorageComponent::BeginPlay()
@@ -57,9 +58,21 @@ void UPalStorageComponent::BeginPlay()
 	{
 		if (UWorld* World = GetWorld())
 		{
-			World->GetTimerManager().SetTimer(RegenTimer, this, &UPalStorageComponent::TickRegen, StoredPalRegenInterval, true);
+			const float EffectiveInterval = FMath::Max(0.1f, StoredPalRegenInterval);
+			World->GetTimerManager().SetTimer(RegenTimer, this, &UPalStorageComponent::TickRegen, EffectiveInterval, true);
+			UE_LOG(LogTemp, Warning, TEXT("[诊断] 存储回血定时器已启动: Owner=%s Interval=%.1fs Percent=%.0f%%"),
+				*GetNameSafe(GetOwner()), EffectiveInterval, StoredPalRegenPercent * 100.f);
 		}
 	}
+}
+
+void UPalStorageComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(RegenTimer);
+	}
+	Super::EndPlay(EndPlayReason);
 }
 
 void UPalStorageComponent::EnsureSlotCounts()
@@ -87,24 +100,41 @@ void UPalStorageComponent::EnsureSlotCounts()
 void UPalStorageComponent::TickRegen()
 {
 	// 到点：背包+仓库全部回血（出战中的槽位以实体属性为准，收回时才回写，跳过避免快照与实体不一致）
-	bool bChanged = false;
+	int32 ChangedPartyCount = 0;
+	int32 ChangedBoxCount = 0;
 	for (int32 i = 0; i < PartyPals.Num(); ++i)
 	{
 		if (i == SummonedPartyIndex)
 		{
 			continue;
 		}
-		bChanged |= ApplyStoredRegen(PartyPals[i]);
+		const float PreviousHealth = PartyPals[i].Health;
+		if (ApplyStoredRegen(PartyPals[i]))
+		{
+			PartyPals.MarkItemDirty(PartyPals[i]);
+			++ChangedPartyCount;
+			UE_LOG(LogTemp, Verbose, TEXT("[诊断] 存储回血槽位: Owner=%s Party[%d] %.1f -> %.1f / %.1f"),
+				*GetNameSafe(GetOwner()), i, PreviousHealth, PartyPals[i].Health, PartyPals[i].MaxHealth);
+		}
 	}
-	for (FStoredPalInfo& Info : BoxPals)
+	for (int32 i = 0; i < BoxPals.Num(); ++i)
 	{
-		bChanged |= ApplyStoredRegen(Info);
+		const float PreviousHealth = BoxPals[i].Health;
+		if (ApplyStoredRegen(BoxPals[i]))
+		{
+			BoxPals.MarkItemDirty(BoxPals[i]);
+			++ChangedBoxCount;
+			UE_LOG(LogTemp, Verbose, TEXT("[诊断] 存储回血槽位: Owner=%s Box[%d] %.1f -> %.1f / %.1f"),
+				*GetNameSafe(GetOwner()), i, PreviousHealth, BoxPals[i].Health, BoxPals[i].MaxHealth);
+		}
 	}
 
-	if (bChanged)
+	if (ChangedPartyCount > 0 || ChangedBoxCount > 0)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[诊断] 存储回血: 背包/仓库帕鲁各回复 MaxHealth 的 %.0f%%"), StoredPalRegenPercent * 100.f);
-		NotifyStorageChanged();
+		UE_LOG(LogTemp, Warning, TEXT("[诊断] 存储回血完成: Owner=%s PartyChanged=%d BoxChanged=%d Percent=%.0f%%"),
+			*GetNameSafe(GetOwner()), ChangedPartyCount, ChangedBoxCount, StoredPalRegenPercent * 100.f);
+		// 上面已逐项 MarkItemDirty，避免每分钟重发全部固定空槽。
+		NotifyStorageChanged(false);
 	}
 }
 
@@ -601,15 +631,19 @@ void UPalStorageComponent::HandleReplicatedStorage()
 	OnStorageChanged.Broadcast();
 }
 
-void UPalStorageComponent::NotifyStorageChanged()
+void UPalStorageComponent::NotifyStorageChanged(bool bMarkAllItemsDirty)
 {
 	OnStorageChanged.Broadcast();
 	if (AActor* OwnerActor = GetOwner())
 	{
 		if (OwnerActor->HasAuthority())
 		{
-			PartyPals.MarkAllDirty();
-			BoxPals.MarkAllDirty();
+			if (bMarkAllItemsDirty)
+			{
+				PartyPals.MarkAllDirty();
+				BoxPals.MarkAllDirty();
+			}
+			++StorageRevision;
 		}
 		OwnerActor->ForceNetUpdate();
 	}

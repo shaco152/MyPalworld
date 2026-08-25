@@ -141,6 +141,8 @@ void APalPlayerController::SetupInputComponent()
 	{
 		EIC->BindAction(BattleCameraHoldAction, ETriggerEvent::Started, this, &APalPlayerController::OnBattleCameraHoldPressed);
 		EIC->BindAction(BattleCameraHoldAction, ETriggerEvent::Completed, this, &APalPlayerController::OnBattleCameraHoldReleased);
+		// IA 配置了 Hold Trigger 时，未达到阈值便松开会走 Canceled 而不是 Completed。
+		EIC->BindAction(BattleCameraHoldAction, ETriggerEvent::Canceled, this, &APalPlayerController::OnBattleCameraHoldReleased);
 	}
 	else if (GEngine)
 	{
@@ -299,12 +301,26 @@ void APalPlayerController::OnTurnBattlePressed()
 
 void APalPlayerController::OnBattleCameraHoldPressed()
 {
+	const APlayerCharacter* PlayerPawn = Cast<APlayerCharacter>(GetPawn());
+	const UTurnBattleComponent* Battle = PlayerPawn ? PlayerPawn->GetTurnBattleComponent() : nullptr;
+	if (!Battle || !Battle->IsActive())
+	{
+		return;
+	}
+
 	bBattleCameraHeld = true;
+	bBattleCameraMovedThisDrag = false;
+	UE_LOG(LogTemp, Warning, TEXT("[诊断] 战斗相机右键拖拽开始"));
 }
 
 void APalPlayerController::OnBattleCameraHoldReleased()
 {
+	if (bBattleCameraHeld)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[诊断] 战斗相机右键拖拽结束：Moved=%d"), bBattleCameraMovedThisDrag);
+	}
 	bBattleCameraHeld = false;
+	bBattleCameraMovedThisDrag = false;
 }
 
 void APalPlayerController::OnBattleCameraRotate(const FInputActionValue& Value)
@@ -320,10 +336,26 @@ void APalPlayerController::OnBattleCameraRotate(const FInputActionValue& Value)
 		{
 			if (Battle->IsActive())
 			{
-				Battle->RotateBattleCamera(Value.Get<FVector2D>());
+				const FVector2D Delta = Value.Get<FVector2D>();
+				if (!Delta.IsNearlyZero())
+				{
+					Battle->RotateBattleCamera(Delta);
+					if (!bBattleCameraMovedThisDrag)
+					{
+						bBattleCameraMovedThisDrag = true;
+						UE_LOG(LogTemp, Warning, TEXT("[诊断] 战斗相机首次收到旋转输入：Delta=(%.3f, %.3f)"),
+							Delta.X, Delta.Y);
+					}
+				}
 			}
 		}
 	}
+}
+
+void APalPlayerController::ResetBattleCameraInputState()
+{
+	bBattleCameraHeld = false;
+	bBattleCameraMovedThisDrag = false;
 }
 
 bool APalPlayerController::IsGameplayInputBlocked() const
